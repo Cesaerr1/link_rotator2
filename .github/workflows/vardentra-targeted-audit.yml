@@ -1,83 +1,10 @@
-name: Vardentra targeted search and tabs audit 2026-08-09
+name: Archived Vardentra targeted audit
 
 on:
-  push:
-    branches:
-      - agent/vardentra-targeted-audit-20260809
   workflow_dispatch:
 
 jobs:
-  audit:
+  archived:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: Install Playwright
-        run: |
-          npm init -y >/dev/null 2>&1
-          npm install playwright@1.55.0 >/dev/null 2>&1
-          npx playwright install --with-deps chromium >/dev/null
-      - name: Audit search and product tabs
-        shell: bash
-        run: |
-          mkdir -p audit
-          cat > audit.js <<'JS'
-          const { chromium } = require('playwright');
-          const fs = require('fs');
-          const base='https://vardentra.myshoplaza.com/';
-          const password='123'+'456';
-          const product='/products/bad-boy-magnum-54-in-24-hp-gas-zero-turn-mower';
-          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-          (async()=>{
-            const browser=await chromium.launch({headless:true});
-            const context=await browser.newContext({viewport:{width:1440,height:1000},ignoreHTTPSErrors:true,locale:'en-US',userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'});
-            const auth=await context.request.post(new URL('/api/password/v2',base).href,{form:{password},failOnStatusCode:false,maxRedirects:10,timeout:60000});
-            const results={auth:auth.status()};
-
-            const api=await context.request.get(new URL('/api/search?keyword=mower&page=0&limit=16',base).href,{failOnStatusCode:false,timeout:60000});
-            const apiText=await api.text();
-            results.searchApi={status:api.status(),contentType:api.headers()['content-type']||'',length:apiText.length,prefix:apiText.slice(0,1000)};
-            fs.writeFileSync('audit/search-api.json',apiText);
-
-            const searchPage=await context.newPage();
-            const searchResponse=await searchPage.goto(new URL('/search?q=mower',base).href,{waitUntil:'domcontentloaded',timeout:90000});
-            await searchPage.waitForLoadState('networkidle',{timeout:20000}).catch(()=>{});await sleep(1500);
-            await searchPage.screenshot({path:'audit/search.png',fullPage:true});
-            results.searchPage=await searchPage.evaluate(()=>({
-              statusTitle:document.title,url:location.href,h1:document.querySelector('h1')?.innerText||'',bodyText:document.body.innerText.replace(/\s+/g,' ').trim().slice(0,3000),
-              productCards:document.querySelectorAll('[data-product-card],.vd-api-product-card,.vd-product-card,.shoplazza-product-snippet').length,
-              productGridChildren:document.querySelector('.vd-product-grid')?.children.length||0,
-              configText:document.querySelector('.vd-config')?.innerText||'',
-              searchInputs:[...document.querySelectorAll('input')].map(x=>({name:x.name,value:x.value,type:x.type})),
-              links:[...document.querySelectorAll('a[href*="/products/"]')].slice(0,10).map(a=>({text:a.innerText.trim(),href:a.href}))
-            }));
-            results.searchPage.httpStatus=searchResponse?.status()||'';
-            fs.writeFileSync('audit/search.html',await searchPage.content());
-
-            const productPage=await context.newPage();
-            const productResponse=await productPage.goto(new URL(product,base).href,{waitUntil:'domcontentloaded',timeout:90000});
-            await productPage.waitForLoadState('networkidle',{timeout:20000}).catch(()=>{});await sleep(1000);
-            const buttons=productPage.locator('[data-tab-button]');
-            results.tabs={httpStatus:productResponse?.status()||'',count:await buttons.count(),texts:await buttons.allInnerTexts()};
-            if(await buttons.count()>=3){
-              await buttons.nth(1).click();await sleep(250);
-              results.tabs.afterReview=await productPage.evaluate(()=>({selected:[...document.querySelectorAll('[data-tab-button]')].map(x=>x.getAttribute('aria-selected')),activePanels:[...document.querySelectorAll('[data-tab-panel]')].map(x=>x.classList.contains('is-active'))}));
-              await buttons.nth(2).click();await sleep(250);
-              results.tabs.afterShipping=await productPage.evaluate(()=>({selected:[...document.querySelectorAll('[data-tab-button]')].map(x=>x.getAttribute('aria-selected')),activePanels:[...document.querySelectorAll('[data-tab-panel]')].map(x=>x.classList.contains('is-active'))}));
-            }
-            await productPage.screenshot({path:'audit/product-tabs.png',fullPage:true});
-            fs.writeFileSync('audit/product.html',await productPage.content());
-            fs.writeFileSync('audit/results.json',JSON.stringify(results,null,2));
-            await browser.close();
-          })().catch(e=>{fs.mkdirSync('audit',{recursive:true});fs.writeFileSync('audit/FATAL.txt',String(e.stack||e));process.exitCode=1});
-          JS
-          node audit.js
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: vardentra-targeted-audit-20260809
-          path: audit/
-          retention-days: 1
-          compression-level: 6
+      - run: echo "Audit complete; credentials removed."
