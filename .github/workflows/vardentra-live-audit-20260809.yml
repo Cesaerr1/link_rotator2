@@ -1,0 +1,163 @@
+name: Vardentra live storefront audit 2026-08-09
+
+on:
+  push:
+    branches:
+      - agent/vardentra-live-audit-20260809
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install Playwright
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install playwright@1.55.0 >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null
+      - name: Audit public Vardentra storefront
+        env:
+          STORE_URL: https://vardentra.com/
+        shell: bash
+        run: |
+          mkdir -p audit/screenshots audit/html
+          cat > audit.js <<'JS'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const base = process.env.STORE_URL;
+          const coreRoutes = [
+            '/', '/collections/all-products', '/collections/car-lift', '/collections/cardio-machines',
+            '/collections/electric-bicycles', '/collections/fishing-kayaks', '/collections/garden-essentials',
+            '/collections/gazebo-pergolas', '/collections/handy-mowers', '/collections/home-finds',
+            '/collections/portable-generators', '/collections/ride-mowers', '/collections/sheds',
+            '/collections/swing-sets', '/collections/trampoline',
+            '/pages/about-us', '/pages/contact-us', '/pages/faqs', '/pages/order-status',
+            '/pages/shipping-policy', '/pages/refund-and-returns-policy', '/pages/privacy-policy',
+            '/pages/terms-of-service', '/pages/billing-policy', '/pages/cookie-policy',
+            '/pages/wishlist', '/pages/compare', '/order-verify', '/cart', '/search?q=mower',
+            '/pages/billing-terms', '/pages/warranty-policy', '/pages/wholesale-policy',
+            '/pages/security-reporting', '/account/order_lookup'
+          ];
+          const safe = route => route === '/' ? 'home' : route.replace(/^\//,'').replace(/[?&=#/]+/g,'-').replace(/-+$/,'');
+          const sameHost = href => { try { return new URL(href, base).hostname === new URL(base).hostname; } catch { return false; } };
+          const normalize = href => { try { const u=new URL(href,base); u.hash=''; return u.href; } catch { return ''; } };
+          const text = value => String(value||'').replace(/\s+/g,' ').trim();
+
+          (async()=>{
+            const browser = await chromium.launch({headless:true});
+            const context = await browser.newContext({viewport:{width:1440,height:1100},ignoreHTTPSErrors:true});
+            const page = await context.newPage();
+            const consoleErrors=[]; const pageErrors=[]; const failedRequests=[];
+            page.on('console',m=>{ if(m.type()==='error') consoleErrors.push({page:page.url(),text:m.text()}); });
+            page.on('pageerror',e=>pageErrors.push({page:page.url(),text:String(e.stack||e)}));
+            page.on('requestfailed',r=>failedRequests.push({page:page.url(),url:r.url(),reason:r.failure()?.errorText||''}));
+
+            // Collect representative products from native search API.
+            const queries=['','mower','kayak','lift','bike','generator','shed','swing','trampoline','gazebo','cardio','garden'];
+            const productsByHandle=new Map();
+            for(const keyword of queries){
+              try{
+                const res=await context.request.get(new URL('/api/search',base).href,{params:{keyword,page:0,limit:100},timeout:60000,failOnStatusCode:false});
+                const payload=await res.json().catch(()=>null);
+                for(const item of payload?.data?.products||[]){
+                  if(item.handle) productsByHandle.set(item.handle,item);
+                }
+              }catch(e){}
+            }
+            const productSample=[...productsByHandle.values()].sort((a,b)=>String(a.handle).localeCompare(String(b.handle))).filter((_,i,arr)=>i<28||i>=arr.length-4);
+            const productRoutes=productSample.map(p=>`/products/${p.handle}`);
+            const routes=[...coreRoutes,...productRoutes];
+            const results=[];
+            for(const route of routes){
+              let response=null,navError='';
+              try{
+                response=await page.goto(new URL(route,base).href,{waitUntil:'domcontentloaded',timeout:90000});
+                await page.waitForLoadState('networkidle',{timeout:30000}).catch(()=>{});
+                await page.waitForTimeout(route==='/'?4500:1200);
+              }catch(e){navError=String(e)}
+              const name=safe(route);
+              if(['/','/pages/order-status','/order-verify','/collections/all-products'].includes(route)||route.startsWith('/products/')){
+                if(route==='/'||route==='/pages/order-status'||route==='/order-verify'||route===productRoutes[0]){
+                  await page.screenshot({path:`audit/screenshots/${name}.png`,fullPage:true}).catch(()=>{});
+                }
+              }
+              const data=await page.evaluate(()=>{
+                const main=document.querySelector('main,#MainContent,[role=main]')||document.body;
+                const images=[...document.images].map(img=>({src:img.currentSrc||img.src,alt:img.alt,displayed:!!(img.offsetWidth||img.offsetHeight||img.getClientRects().length),complete:img.complete,naturalWidth:img.naturalWidth,naturalHeight:img.naturalHeight}));
+                const links=[...document.querySelectorAll('a[href]')].map(a=>({text:(a.innerText||a.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim(),href:a.href}));
+                const forms=[...document.forms].map(f=>({action:f.action,method:f.method,inputs:[...f.elements].map(e=>({name:e.name,type:e.type,required:e.required})).filter(x=>x.name)}));
+                const productMeta=[...document.querySelectorAll('.vd-product-taxonomy li,.product-meta li,[data-product-meta]')].map(x=>(x.innerText||'').replace(/\s+/g,' ').trim());
+                const desc=document.querySelector('[data-tab-panel="description"],.vd-product-description,.product-description,.rte');
+                const gallery=document.querySelector('.vd-product-gallery,.product-gallery,[data-product-gallery]');
+                const stage=gallery?.querySelector('.vd-product-stage,.product-main-image,[data-product-stage]');
+                return {
+                  title:document.title,
+                  h1:document.querySelector('h1')?.innerText?.trim()||'',
+                  mainTextLength:(main.innerText||'').replace(/\s+/g,' ').trim().length,
+                  canonical:document.querySelector('link[rel=canonical]')?.href||'',
+                  productCards:document.querySelectorAll('[data-product-card],.vd-api-product-card,.vd-product-card').length,
+                  brokenImages:images.filter(i=>i.displayed&&(!i.complete||!i.naturalWidth)),
+                  images,links,forms,productMeta,
+                  skuText:[...document.querySelectorAll('[data-sku-value],.vd-product-sku,.sku')].map(x=>(x.innerText||'').trim()).filter(Boolean),
+                  priceText:[...document.querySelectorAll('.vd-product-price,.price,[data-product-price]')].map(x=>(x.innerText||'').replace(/\s+/g,' ').trim()).filter(Boolean).slice(0,5),
+                  descriptionText:(desc?.innerText||'').replace(/\s+/g,' ').trim().slice(0,1200),
+                  descriptionHTML:(desc?.innerHTML||'').slice(0,5000),
+                  descriptionWordCount:(desc?.innerText||'').trim().split(/\s+/).filter(Boolean).length,
+                  galleryAspect:stage?{width:stage.getBoundingClientRect().width,height:stage.getBoundingClientRect().height}:null,
+                  thumbnailCount:gallery?gallery.querySelectorAll('img').length:0,
+                  relatedCards:document.querySelectorAll('[data-related-grid] [data-product-card],.vd-related [data-product-card],.related-products [data-product-card]').length,
+                  emptyLinks:links.filter(l=>!l.href||l.href.endsWith('#')||l.href.startsWith('javascript:')),
+                  overflow:{bodyScrollWidth:document.body.scrollWidth,bodyClientWidth:document.body.clientWidth,htmlScrollWidth:document.documentElement.scrollWidth,htmlClientWidth:document.documentElement.clientWidth}
+                };
+              }).catch(()=>({evaluationError:true}));
+              results.push({route,finalUrl:page.url(),status:response?.status()||null,navError,...data});
+              fs.writeFileSync(`audit/html/${name}.html`,await page.content().catch(()=>''));
+            }
+
+            const allLinks=[...new Set(results.flatMap(r=>(r.links||[]).map(l=>normalize(l.href))).filter(Boolean))];
+            const internal=allLinks.filter(sameHost).slice(0,700);
+            const linkChecks=[];
+            for(const href of internal){
+              try{
+                const res=await context.request.get(href,{timeout:30000,failOnStatusCode:false,maxRedirects:8});
+                linkChecks.push({href,status:res.status(),finalUrl:res.url(),contentType:res.headers()['content-type']||''});
+              }catch(e){linkChecks.push({href,error:String(e)});}
+            }
+
+            const productResults=results.filter(r=>r.route.startsWith('/products/'));
+            const summary={
+              auditedAt:new Date().toISOString(),base,routeCount:results.length,productPagesSampled:productResults.length,
+              confirmed404Routes:results.filter(r=>r.status===404).map(r=>r.route),
+              brokenDisplayedImages:results.reduce((n,r)=>n+(r.brokenImages?.length||0),0),
+              linkChecks:linkChecks.length,linkHttpErrors:linkChecks.filter(x=>x.status>=400).length,
+              brokenInternalLinks:linkChecks.filter(x=>x.status>=400),
+              emptyContentRoutes:results.filter(r=>typeof r.mainTextLength==='number'&&r.mainTextLength<100).map(r=>r.route),
+              horizontalOverflowRoutes:results.filter(r=>r.overflow&&r.overflow.bodyScrollWidth>r.overflow.bodyClientWidth+2).map(r=>r.route),
+              productMissingSKU:productResults.filter(r=>!(r.skuText||[]).join('')).map(r=>r.route),
+              productMissingCategory:productResults.filter(r=>!((r.productMeta||[]).join(' ').match(/Category:/i))).map(r=>r.route),
+              productMissingBrand:productResults.filter(r=>!((r.productMeta||[]).join(' ').match(/Brand:/i))).map(r=>r.route),
+              productEmptyDescriptions:productResults.filter(r=>(r.descriptionWordCount||0)<20).map(r=>r.route),
+              productNonSquareStages:productResults.filter(r=>r.galleryAspect&&Math.abs(r.galleryAspect.width-r.galleryAspect.height)>8).map(r=>({route:r.route,aspect:r.galleryAspect})),
+              productMissingRelated:productResults.filter(r=>(r.relatedCards||0)===0).map(r=>r.route),
+              orderStatusForms:results.find(r=>r.route==='/pages/order-status')?.forms||[],
+              orderVerifyForms:results.find(r=>r.route==='/order-verify')?.forms||[],
+              consoleErrors:consoleErrors.length,pageErrors:pageErrors.length,failedRequests:failedRequests.length
+            };
+            fs.writeFileSync('audit/results.json',JSON.stringify({summary,results,linkChecks,consoleErrors,pageErrors,failedRequests,productSample},null,2));
+            fs.writeFileSync('audit/summary.txt',Object.entries(summary).map(([k,v])=>`${k}: ${typeof v==='object'?JSON.stringify(v):v}`).join('\n'));
+            await context.close(); await browser.close();
+          })().catch(e=>{fs.mkdirSync('audit',{recursive:true});fs.writeFileSync('audit/fatal.txt',String(e.stack||e));process.exitCode=1;});
+          JS
+          node audit.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vardentra-live-audit-20260809
+          path: audit/
+          retention-days: 1
+          compression-level: 6
