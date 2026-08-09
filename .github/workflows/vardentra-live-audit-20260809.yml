@@ -1,4 +1,4 @@
-name: Vardentra live storefront audit 2026-08-09
+name: Vardentra fresh source catalogue 2026-08-09
 
 on:
   push:
@@ -7,161 +7,128 @@ on:
   workflow_dispatch:
 
 jobs:
-  audit:
+  source-catalogue:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-python@v5
         with:
-          node-version: '20'
-      - name: Install Playwright
-        run: |
-          npm init -y >/dev/null 2>&1
-          npm install playwright@1.55.0 >/dev/null 2>&1
-          npx playwright install --with-deps chromium >/dev/null
-      - name: Audit password-protected Vardentra storefront
-        env:
-          STORE_URL: https://www.vardentra.com/
-          VIEWER_PASSWORD: '123456'
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 lxml
+      - name: Fetch fresh public Ibenry catalogue
         shell: bash
         run: |
-          mkdir -p audit/screenshots audit/html
-          cat > audit.js <<'JS'
-          const { chromium } = require('playwright');
-          const fs = require('fs');
-          const base = process.env.STORE_URL;
-          const coreRoutes = [
-            '/', '/collections/all-products', '/collections/car-lift', '/collections/cardio-machines',
-            '/collections/electric-bicycles', '/collections/fishing-kayaks', '/collections/garden-essentials',
-            '/collections/gazebo-pergolas', '/collections/handy-mowers', '/collections/home-finds',
-            '/collections/portable-generators', '/collections/ride-mowers', '/collections/sheds',
-            '/collections/swing-sets', '/collections/trampoline',
-            '/pages/about-us', '/pages/contact-us', '/pages/faqs', '/pages/order-status',
-            '/pages/shipping-policy', '/pages/refund-and-returns-policy', '/pages/privacy-policy',
-            '/pages/terms-of-service', '/pages/billing-policy', '/pages/cookie-policy',
-            '/pages/wishlist', '/pages/compare', '/order-verify', '/cart', '/search?q=mower',
-            '/pages/billing-terms', '/pages/warranty-policy', '/pages/wholesale-policy',
-            '/pages/security-reporting', '/account/order_lookup'
-          ];
-          const safe = route => route === '/' ? 'home' : route.replace(/^\//,'').replace(/[?&=#/]+/g,'-').replace(/-+$/,'');
-          const baseHost = new URL(base).hostname;
-          const sameHost = href => { try { const h=new URL(href,base).hostname; return h===baseHost || h===baseHost.replace(/^www\./,'') || `www.${h}`===baseHost; } catch { return false; } };
-          const normalize = href => { try { const u=new URL(href,base); u.hash=''; return u.href; } catch { return ''; } };
+          mkdir -p source
+          cat > source/fetch_source.py <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
 
-          (async()=>{
-            const browser = await chromium.launch({headless:true});
-            const context = await browser.newContext({viewport:{width:1440,height:1100},ignoreHTTPSErrors:true});
-            const auth = await context.request.post(new URL('/api/password/v2',base).href,{
-              form:{password:process.env.VIEWER_PASSWORD},
-              failOnStatusCode:false,
-              maxRedirects:10
-            });
-            const page = await context.newPage();
-            const consoleErrors=[]; const pageErrors=[]; const failedRequests=[];
-            page.on('console',m=>{ if(m.type()==='error') consoleErrors.push({page:page.url(),text:m.text()}); });
-            page.on('pageerror',e=>pageErrors.push({page:page.url(),text:String(e.stack||e)}));
-            page.on('requestfailed',r=>failedRequests.push({page:page.url(),url:r.url(),reason:r.failure()?.errorText||''}));
+          BASE='https://ibenry.com'
+          OUT=Path('source')
+          s=requests.Session()
+          retry=Retry(total=5,connect=5,read=5,status=5,backoff_factor=.7,status_forcelist=(429,500,502,503,504),allowed_methods=frozenset({'GET'}),respect_retry_after_header=True)
+          s.mount('https://',HTTPAdapter(max_retries=retry,pool_connections=32,pool_maxsize=32))
+          s.headers.update({'User-Agent':'VardentraMigrationAudit/2.0 (owner-authorized catalogue rebuild)','Accept':'application/json,text/html,*/*'})
 
-            const queries=['','mower','kayak','lift','bike','generator','shed','swing','trampoline','gazebo','cardio','garden'];
-            const productsByHandle=new Map();
-            for(const keyword of queries){
-              try{
-                const res=await context.request.get(new URL('/api/search',base).href,{params:{keyword,page:0,limit:100},timeout:60000,failOnStatusCode:false});
-                const payload=await res.json().catch(()=>null);
-                for(const item of payload?.data?.products||[]){ if(item.handle) productsByHandle.set(item.handle,item); }
-              }catch(e){}
-            }
-            const sorted=[...productsByHandle.values()].sort((a,b)=>String(a.handle).localeCompare(String(b.handle)));
-            const productSample=[];
-            const step=Math.max(1,Math.floor(sorted.length/32));
-            for(let i=0;i<sorted.length&&productSample.length<32;i+=step) productSample.push(sorted[i]);
-            const productRoutes=[...new Set(productSample.map(p=>`/products/${p.handle}`))];
-            const routes=[...coreRoutes,...productRoutes];
-            const results=[];
-            for(const route of routes){
-              let response=null,navError='';
-              try{
-                response=await page.goto(new URL(route,base).href,{waitUntil:'domcontentloaded',timeout:90000});
-                await page.waitForLoadState('networkidle',{timeout:30000}).catch(()=>{});
-                await page.waitForTimeout(route==='/'?4500:1500);
-              }catch(e){navError=String(e)}
-              const name=safe(route);
-              if(route==='/'||route==='/pages/order-status'||route==='/order-verify'||route===productRoutes[0]){
-                await page.screenshot({path:`audit/screenshots/${name}.png`,fullPage:true}).catch(()=>{});
-              }
-              const data=await page.evaluate(()=>{
-                const main=document.querySelector('main,#MainContent,[role=main]')||document.body;
-                const images=[...document.images].map(img=>({src:img.currentSrc||img.src,alt:img.alt,displayed:!!(img.offsetWidth||img.offsetHeight||img.getClientRects().length),complete:img.complete,naturalWidth:img.naturalWidth,naturalHeight:img.naturalHeight}));
-                const links=[...document.querySelectorAll('a[href]')].map(a=>({text:(a.innerText||a.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim(),href:a.href}));
-                const forms=[...document.forms].map(f=>({action:f.action,method:f.method,inputs:[...f.elements].map(e=>({name:e.name,type:e.type,required:e.required})).filter(x=>x.name)}));
-                const productMeta=[...document.querySelectorAll('.vd-product-identity li,.vd-product-taxonomy li,.product-meta li,[data-product-meta]')].map(x=>(x.innerText||'').replace(/\s+/g,' ').trim());
-                const desc=document.querySelector('[data-tab-panel="description"],.vd-product-description,.product-description,.rte');
-                const gallery=document.querySelector('.vd-product-gallery,.product-gallery,[data-product-gallery]');
-                const stage=gallery?.querySelector('.vd-product-stage,.product-main-image,[data-product-stage]');
-                return {
-                  title:document.title,
-                  h1:document.querySelector('h1')?.innerText?.trim()||'',
-                  mainTextLength:(main.innerText||'').replace(/\s+/g,' ').trim().length,
-                  canonical:document.querySelector('link[rel=canonical]')?.href||'',
-                  productCards:document.querySelectorAll('[data-product-card],.vd-api-product-card,.vd-product-card').length,
-                  brokenImages:images.filter(i=>i.displayed&&(!i.complete||!i.naturalWidth)),
-                  images,links,forms,productMeta,
-                  skuText:[...document.querySelectorAll('[data-sku-value],[data-product-sku],.vd-product-sku,.sku')].map(x=>(x.innerText||'').trim()).filter(Boolean),
-                  priceText:[...document.querySelectorAll('.vd-product-price,.price,[data-product-price]')].map(x=>(x.innerText||'').replace(/\s+/g,' ').trim()).filter(Boolean).slice(0,5),
-                  descriptionText:(desc?.innerText||'').replace(/\s+/g,' ').trim().slice(0,1200),
-                  descriptionHTML:(desc?.innerHTML||'').slice(0,5000),
-                  descriptionWordCount:(desc?.innerText||'').trim().split(/\s+/).filter(Boolean).length,
-                  galleryAspect:stage?{width:stage.getBoundingClientRect().width,height:stage.getBoundingClientRect().height}:null,
-                  thumbnailCount:gallery?gallery.querySelectorAll('img').length:0,
-                  relatedCards:document.querySelectorAll('[data-related-grid] [data-product-card],.vd-related [data-product-card],.related-products [data-product-card]').length,
-                  emptyLinks:links.filter(l=>!l.href||l.href.endsWith('#')||l.href.startsWith('javascript:')),
-                  overflow:{bodyScrollWidth:document.body.scrollWidth,bodyClientWidth:document.body.clientWidth,htmlScrollWidth:document.documentElement.scrollWidth,htmlClientWidth:document.documentElement.clientWidth}
-                };
-              }).catch(()=>({evaluationError:true}));
-              results.push({route,finalUrl:page.url(),status:response?.status()||null,navError,...data});
-              fs.writeFileSync(`audit/html/${name}.html`,await page.content().catch(()=>''));
-            }
+          def paged(url):
+              rows=[]; page=1
+              while True:
+                  r=s.get(url,params={'per_page':100,'page':page},timeout=90); r.raise_for_status(); data=r.json()
+                  if not isinstance(data,list): raise RuntimeError(f'Expected list from {r.url}')
+                  rows.extend(data)
+                  total=int(r.headers.get('X-WP-TotalPages',page))
+                  if page>=total or not data: break
+                  page+=1
+              return rows
 
-            const allLinks=[...new Set(results.flatMap(r=>(r.links||[]).map(l=>normalize(l.href))).filter(Boolean))];
-            const internal=allLinks.filter(sameHost).slice(0,700);
-            const linkChecks=[];
-            for(const href of internal){
-              try{
-                const res=await context.request.get(href,{timeout:30000,failOnStatusCode:false,maxRedirects:8});
-                linkChecks.push({href,status:res.status(),finalUrl:res.url(),contentType:res.headers()['content-type']||''});
-              }catch(e){linkChecks.push({href,error:String(e)});}
-            }
+          store=paged(BASE+'/wp-json/wc/store/v1/products')
+          wp=paged(BASE+'/wp-json/wp/v2/product')
+          wp_by_id={int(x['id']):x for x in wp}
 
-            const productResults=results.filter(r=>r.route.startsWith('/products/'));
-            const summary={
-              auditedAt:new Date().toISOString(),base,authStatus:auth.status(),routeCount:results.length,productsDiscovered:productsByHandle.size,productPagesSampled:productResults.length,
-              confirmed404Routes:results.filter(r=>r.status===404).map(r=>r.route),
-              brokenDisplayedImages:results.reduce((n,r)=>n+(r.brokenImages?.length||0),0),
-              linkChecks:linkChecks.length,linkHttpErrors:linkChecks.filter(x=>x.status>=400).length,
-              brokenInternalLinks:linkChecks.filter(x=>x.status>=400),
-              emptyContentRoutes:results.filter(r=>typeof r.mainTextLength==='number'&&r.mainTextLength<100).map(r=>r.route),
-              horizontalOverflowRoutes:results.filter(r=>r.overflow&&r.overflow.bodyScrollWidth>r.overflow.bodyClientWidth+2).map(r=>r.route),
-              productMissingSKU:productResults.filter(r=>!(r.skuText||[]).join('')).map(r=>r.route),
-              productMissingCategory:productResults.filter(r=>!((r.productMeta||[]).join(' ').match(/Category:/i))).map(r=>r.route),
-              productMissingBrand:productResults.filter(r=>!((r.productMeta||[]).join(' ').match(/Brand:/i))).map(r=>r.route),
-              productEmptyDescriptions:productResults.filter(r=>(r.descriptionWordCount||0)<20).map(r=>r.route),
-              productNonSquareStages:productResults.filter(r=>r.galleryAspect&&Math.abs(r.galleryAspect.width-r.galleryAspect.height)>8).map(r=>({route:r.route,aspect:r.galleryAspect})),
-              productMissingRelated:productResults.filter(r=>(r.relatedCards||0)===0).map(r=>r.route),
-              orderStatusForms:results.find(r=>r.route==='/pages/order-status')?.forms||[],
-              orderVerifyForms:results.find(r=>r.route==='/order-verify')?.forms||[],
-              consoleErrors:consoleErrors.length,pageErrors:pageErrors.length,failedRequests:failedRequests.length
-            };
-            fs.writeFileSync('audit/results.json',JSON.stringify({summary,results,linkChecks,consoleErrors,pageErrors,failedRequests,productSample},null,2));
-            fs.writeFileSync('audit/summary.txt',Object.entries(summary).map(([k,v])=>`${k}: ${typeof v==='object'?JSON.stringify(v):v}`).join('\n'));
-            await context.close(); await browser.close();
-          })().catch(e=>{fs.mkdirSync('audit',{recursive:true});fs.writeFileSync('audit/fatal.txt',String(e.stack||e));process.exitCode=1;});
-          JS
-          node audit.js
+          def parse_page(product):
+              url=product.get('permalink') or f"{BASE}/product/{product.get('slug')}/"
+              out={'product_id':product.get('id'),'url':url,'status':0,'page_description_html':'','jsonld_brand':'','variations':[],'error':''}
+              try:
+                  r=s.get(url,timeout=90); out['status']=r.status_code; r.raise_for_status(); soup=BeautifulSoup(r.text,'lxml')
+                  # Product description tabs, excluding review/related content.
+                  desc=soup.select_one('#tab-description,.woocommerce-Tabs-panel--description,[data-tab-panel="description"],.product-description')
+                  if desc: out['page_description_html']=str(desc)
+                  for script in soup.find_all('script',attrs={'type':'application/ld+json'}):
+                      try: data=json.loads(script.get_text(strip=True))
+                      except Exception: continue
+                      stack=data if isinstance(data,list) else [data]
+                      while stack:
+                          node=stack.pop()
+                          if isinstance(node,list): stack.extend(node); continue
+                          if not isinstance(node,dict): continue
+                          typ=node.get('@type'); types=typ if isinstance(typ,list) else [typ]
+                          if 'Product' in types:
+                              brand=node.get('brand')
+                              if isinstance(brand,dict): brand=brand.get('name')
+                              if brand: out['jsonld_brand']=str(brand)
+                          stack.extend(v for v in node.values() if isinstance(v,(dict,list)))
+                  form=soup.select_one('form.variations_form[data-product_variations]')
+                  if form:
+                      raw=form.get('data-product_variations') or ''
+                      try: out['variations']=json.loads(raw)
+                      except Exception: pass
+              except Exception as e: out['error']=repr(e)
+              return out
+
+          pages={}
+          with ThreadPoolExecutor(max_workers=10) as pool:
+              futures={pool.submit(parse_page,p):int(p['id']) for p in store}
+              for i,f in enumerate(as_completed(futures),1):
+                  pid=futures[f]
+                  try: pages[pid]=f.result()
+                  except Exception as e: pages[pid]={'product_id':pid,'error':repr(e),'variations':[]}
+                  if i%50==0: print('pages',i,len(futures),flush=True)
+
+          # Enrich variations when page markup is absent or incomplete.
+          variation_ids=[]
+          for product in store:
+              for item in product.get('variations') or []:
+                  vid=item.get('id') if isinstance(item,dict) else item
+                  if vid: variation_ids.append(int(vid))
+          variants={}
+          def fetch_variant(vid):
+              r=s.get(f'{BASE}/wp-json/wc/store/v1/products/{vid}',timeout=60); r.raise_for_status(); return vid,r.json()
+          with ThreadPoolExecutor(max_workers=12) as pool:
+              futures=[pool.submit(fetch_variant,vid) for vid in variation_ids]
+              for i,f in enumerate(as_completed(futures),1):
+                  try: vid,data=f.result(); variants[vid]=data
+                  except Exception as e: pass
+                  if i%50==0: print('variants',i,len(futures),flush=True)
+
+          products=[]
+          for item in store:
+              pid=int(item['id'])
+              products.append({'store':item,'wp':wp_by_id.get(pid,{}),'page':pages.get(pid,{}),'variation_records':[variants.get(int(v.get('id') if isinstance(v,dict) else v),{}) for v in item.get('variations') or []]})
+
+          summary={
+              'fetched_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+              'store_products':len(store),'wp_products':len(wp),'variation_records':len(variants),
+              'page_success':sum(1 for x in pages.values() if x.get('status')==200),
+              'page_errors':sum(1 for x in pages.values() if x.get('error')),
+              'currency_codes':sorted({(p.get('prices') or {}).get('currency_code') for p in store if (p.get('prices') or {}).get('currency_code')}),
+          }
+          (OUT/'Ibenry_Fresh_Source_Catalogue.json').write_text(json.dumps({'summary':summary,'products':products},ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'Ibenry_Fresh_Source_Summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          print(json.dumps(summary,indent=2))
+          PY
+          python source/fetch_source.py | tee source/run.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: vardentra-live-audit-20260809
-          path: audit/
+          name: ibenry-fresh-source-catalogue-20260809
+          path: source/
           retention-days: 1
           compression-level: 6
