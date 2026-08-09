@@ -20,9 +20,10 @@ jobs:
           npm init -y >/dev/null 2>&1
           npm install playwright@1.55.0 >/dev/null 2>&1
           npx playwright install --with-deps chromium >/dev/null
-      - name: Audit public Vardentra storefront
+      - name: Audit password-protected Vardentra storefront
         env:
-          STORE_URL: https://vardentra.com/
+          STORE_URL: https://www.vardentra.com/
+          VIEWER_PASSWORD: '123456'
         shell: bash
         run: |
           mkdir -p audit/screenshots audit/html
@@ -44,33 +45,38 @@ jobs:
             '/pages/security-reporting', '/account/order_lookup'
           ];
           const safe = route => route === '/' ? 'home' : route.replace(/^\//,'').replace(/[?&=#/]+/g,'-').replace(/-+$/,'');
-          const sameHost = href => { try { return new URL(href, base).hostname === new URL(base).hostname; } catch { return false; } };
+          const baseHost = new URL(base).hostname;
+          const sameHost = href => { try { const h=new URL(href,base).hostname; return h===baseHost || h===baseHost.replace(/^www\./,'') || `www.${h}`===baseHost; } catch { return false; } };
           const normalize = href => { try { const u=new URL(href,base); u.hash=''; return u.href; } catch { return ''; } };
-          const text = value => String(value||'').replace(/\s+/g,' ').trim();
 
           (async()=>{
             const browser = await chromium.launch({headless:true});
             const context = await browser.newContext({viewport:{width:1440,height:1100},ignoreHTTPSErrors:true});
+            const auth = await context.request.post(new URL('/api/password/v2',base).href,{
+              form:{password:process.env.VIEWER_PASSWORD},
+              failOnStatusCode:false,
+              maxRedirects:10
+            });
             const page = await context.newPage();
             const consoleErrors=[]; const pageErrors=[]; const failedRequests=[];
             page.on('console',m=>{ if(m.type()==='error') consoleErrors.push({page:page.url(),text:m.text()}); });
             page.on('pageerror',e=>pageErrors.push({page:page.url(),text:String(e.stack||e)}));
             page.on('requestfailed',r=>failedRequests.push({page:page.url(),url:r.url(),reason:r.failure()?.errorText||''}));
 
-            // Collect representative products from native search API.
             const queries=['','mower','kayak','lift','bike','generator','shed','swing','trampoline','gazebo','cardio','garden'];
             const productsByHandle=new Map();
             for(const keyword of queries){
               try{
                 const res=await context.request.get(new URL('/api/search',base).href,{params:{keyword,page:0,limit:100},timeout:60000,failOnStatusCode:false});
                 const payload=await res.json().catch(()=>null);
-                for(const item of payload?.data?.products||[]){
-                  if(item.handle) productsByHandle.set(item.handle,item);
-                }
+                for(const item of payload?.data?.products||[]){ if(item.handle) productsByHandle.set(item.handle,item); }
               }catch(e){}
             }
-            const productSample=[...productsByHandle.values()].sort((a,b)=>String(a.handle).localeCompare(String(b.handle))).filter((_,i,arr)=>i<28||i>=arr.length-4);
-            const productRoutes=productSample.map(p=>`/products/${p.handle}`);
+            const sorted=[...productsByHandle.values()].sort((a,b)=>String(a.handle).localeCompare(String(b.handle)));
+            const productSample=[];
+            const step=Math.max(1,Math.floor(sorted.length/32));
+            for(let i=0;i<sorted.length&&productSample.length<32;i+=step) productSample.push(sorted[i]);
+            const productRoutes=[...new Set(productSample.map(p=>`/products/${p.handle}`))];
             const routes=[...coreRoutes,...productRoutes];
             const results=[];
             for(const route of routes){
@@ -78,20 +84,18 @@ jobs:
               try{
                 response=await page.goto(new URL(route,base).href,{waitUntil:'domcontentloaded',timeout:90000});
                 await page.waitForLoadState('networkidle',{timeout:30000}).catch(()=>{});
-                await page.waitForTimeout(route==='/'?4500:1200);
+                await page.waitForTimeout(route==='/'?4500:1500);
               }catch(e){navError=String(e)}
               const name=safe(route);
-              if(['/','/pages/order-status','/order-verify','/collections/all-products'].includes(route)||route.startsWith('/products/')){
-                if(route==='/'||route==='/pages/order-status'||route==='/order-verify'||route===productRoutes[0]){
-                  await page.screenshot({path:`audit/screenshots/${name}.png`,fullPage:true}).catch(()=>{});
-                }
+              if(route==='/'||route==='/pages/order-status'||route==='/order-verify'||route===productRoutes[0]){
+                await page.screenshot({path:`audit/screenshots/${name}.png`,fullPage:true}).catch(()=>{});
               }
               const data=await page.evaluate(()=>{
                 const main=document.querySelector('main,#MainContent,[role=main]')||document.body;
                 const images=[...document.images].map(img=>({src:img.currentSrc||img.src,alt:img.alt,displayed:!!(img.offsetWidth||img.offsetHeight||img.getClientRects().length),complete:img.complete,naturalWidth:img.naturalWidth,naturalHeight:img.naturalHeight}));
                 const links=[...document.querySelectorAll('a[href]')].map(a=>({text:(a.innerText||a.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim(),href:a.href}));
                 const forms=[...document.forms].map(f=>({action:f.action,method:f.method,inputs:[...f.elements].map(e=>({name:e.name,type:e.type,required:e.required})).filter(x=>x.name)}));
-                const productMeta=[...document.querySelectorAll('.vd-product-taxonomy li,.product-meta li,[data-product-meta]')].map(x=>(x.innerText||'').replace(/\s+/g,' ').trim());
+                const productMeta=[...document.querySelectorAll('.vd-product-identity li,.vd-product-taxonomy li,.product-meta li,[data-product-meta]')].map(x=>(x.innerText||'').replace(/\s+/g,' ').trim());
                 const desc=document.querySelector('[data-tab-panel="description"],.vd-product-description,.product-description,.rte');
                 const gallery=document.querySelector('.vd-product-gallery,.product-gallery,[data-product-gallery]');
                 const stage=gallery?.querySelector('.vd-product-stage,.product-main-image,[data-product-stage]');
@@ -103,7 +107,7 @@ jobs:
                   productCards:document.querySelectorAll('[data-product-card],.vd-api-product-card,.vd-product-card').length,
                   brokenImages:images.filter(i=>i.displayed&&(!i.complete||!i.naturalWidth)),
                   images,links,forms,productMeta,
-                  skuText:[...document.querySelectorAll('[data-sku-value],.vd-product-sku,.sku')].map(x=>(x.innerText||'').trim()).filter(Boolean),
+                  skuText:[...document.querySelectorAll('[data-sku-value],[data-product-sku],.vd-product-sku,.sku')].map(x=>(x.innerText||'').trim()).filter(Boolean),
                   priceText:[...document.querySelectorAll('.vd-product-price,.price,[data-product-price]')].map(x=>(x.innerText||'').replace(/\s+/g,' ').trim()).filter(Boolean).slice(0,5),
                   descriptionText:(desc?.innerText||'').replace(/\s+/g,' ').trim().slice(0,1200),
                   descriptionHTML:(desc?.innerHTML||'').slice(0,5000),
@@ -131,7 +135,7 @@ jobs:
 
             const productResults=results.filter(r=>r.route.startsWith('/products/'));
             const summary={
-              auditedAt:new Date().toISOString(),base,routeCount:results.length,productPagesSampled:productResults.length,
+              auditedAt:new Date().toISOString(),base,authStatus:auth.status(),routeCount:results.length,productsDiscovered:productsByHandle.size,productPagesSampled:productResults.length,
               confirmed404Routes:results.filter(r=>r.status===404).map(r=>r.route),
               brokenDisplayedImages:results.reduce((n,r)=>n+(r.brokenImages?.length||0),0),
               linkChecks:linkChecks.length,linkHttpErrors:linkChecks.filter(x=>x.status>=400).length,
