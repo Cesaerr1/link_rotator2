@@ -1,0 +1,400 @@
+name: Vardentra final GMC readiness audit
+
+on:
+  push:
+    branches:
+      - agent/vardentra-gmc-final-audit-20260812
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install audit dependencies
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install playwright@1.55.0 cheerio@1.0.0 >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null
+      - name: Run authenticated storefront audit
+        shell: bash
+        run: |
+          mkdir -p audit/screenshots
+          cat > audit.js <<'JS'
+          const { chromium } = require('playwright');
+          const cheerio = require('cheerio');
+          const fs = require('fs');
+
+          const CUSTOM = new URL('https://www.vardentra.com/');
+          const ORIGIN = new URL('https://vardentra.myshoplaza.com/');
+          const PASSWORD = '123' + '456';
+          const expected = {
+            brand: 'Vardentra',
+            email: 'support@vardentra.com',
+            phoneDisplay: '+1 (719) 505-9306',
+            phoneDigits: '17195059306',
+            address: '7889 S Oakleaf St, Bennett, CO 80102, USA',
+            addressNeedle: '7889 s oakleaf st'
+          };
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+          const safe = value => value === '/' ? 'home' : value.replace(/^\//,'').replace(/[?&#=/]+/g,'-').replace(/-+$/,'').slice(0,160) || 'route';
+          const normalize = (href, base = CUSTOM) => {
+            try {
+              const url = new URL(href, base);
+              url.hash = '';
+              url.searchParams.delete('spm');
+              url.searchParams.delete('spm_prev');
+              url.searchParams.delete('st');
+              return url.href;
+            } catch { return ''; }
+          };
+          const sameStore = href => {
+            try {
+              const host = new URL(href, CUSTOM).hostname.replace(/^www\./,'');
+              return ['vardentra.com','vardentra.myshoplaza.com'].includes(host);
+            } catch { return false; }
+          };
+          const writeCsv = (file, rows) => {
+            if (!rows.length) { fs.writeFileSync(file, ''); return; }
+            const headers = [...new Set(rows.flatMap(row => Object.keys(row)))];
+            const escape = value => {
+              const text = typeof value === 'object' ? JSON.stringify(value) : String(value ?? '');
+              return /[",\n]/.test(text) ? `"${text.replace(/"/g,'""')}"` : text;
+            };
+            fs.writeFileSync(file, [headers.map(escape).join(','), ...rows.map(row => headers.map(h => escape(row[h])).join(','))].join('\n') + '\n');
+          };
+
+          const routes = [
+            '/',
+            '/collections/all-products','/collections/car-lift','/collections/cardio-machines','/collections/electric-bicycles',
+            '/collections/fishing-kayaks','/collections/garden-essentials','/collections/gazebo-pergolas','/collections/handy-mowers',
+            '/collections/home-finds','/collections/portable-generators','/collections/ride-mowers','/collections/sheds',
+            '/collections/swing-sets','/collections/trampoline',
+            '/pages/about-us','/pages/contact-us','/pages/faqs','/pages/order-status','/pages/shipping-policy',
+            '/pages/refund-and-returns-policy','/pages/privacy-policy','/pages/terms-of-service','/pages/billing-policy',
+            '/pages/cookie-policy','/pages/wishlist','/pages/compare',
+            '/cart','/search?q=mower','/account/login','/account/register',
+            '/pages/billing-terms','/pages/warranty-policy','/pages/wholesale-policy','/pages/security-reporting',
+            '/order-verify','/account/order_lookup','/account','/account/forgot-password'
+          ];
+          const policyRoutes = [
+            '/pages/about-us','/pages/contact-us','/pages/faqs','/pages/order-status','/pages/shipping-policy',
+            '/pages/refund-and-returns-policy','/pages/privacy-policy','/pages/terms-of-service','/pages/billing-policy',
+            '/pages/cookie-policy','/pages/billing-terms','/pages/warranty-policy','/pages/wholesale-policy','/pages/security-reporting'
+          ];
+
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext({
+              viewport: { width: 1440, height: 1050 },
+              ignoreHTTPSErrors: true,
+              locale: 'en-US',
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+            });
+
+            // Record what an unauthenticated crawler/reviewer sees.
+            const preauth = {};
+            for (const [label, base] of [['custom', CUSTOM], ['origin', ORIGIN]]) {
+              try {
+                const response = await context.request.get(base.href, { failOnStatusCode: false, timeout: 60000 });
+                const html = await response.text();
+                const $ = cheerio.load(html);
+                preauth[label] = {
+                  status: response.status(), final_url: response.url(), title: clean($('title').text()),
+                  password_form: $('input[type="password"]').length > 0,
+                  robots_meta: $('meta[name="robots"]').attr('content') || '',
+                  text_prefix: clean($('body').text()).slice(0,500)
+                };
+              } catch (error) { preauth[label] = { error: String(error) }; }
+            }
+            for (const file of ['/robots.txt','/sitemap.xml']) {
+              try {
+                const response = await context.request.get(new URL(file, CUSTOM).href, { failOnStatusCode: false, timeout: 60000 });
+                preauth[file] = { status: response.status(), final_url: response.url(), content_type: response.headers()['content-type'] || '', body_prefix: (await response.text()).slice(0,3000) };
+              } catch (error) { preauth[file] = { error: String(error) }; }
+            }
+
+            const authCustom = await context.request.post(new URL('/api/password/v2', CUSTOM).href, { form: { password: PASSWORD }, failOnStatusCode: false, maxRedirects: 10, timeout: 60000 });
+            const authOrigin = await context.request.post(new URL('/api/password/v2', ORIGIN).href, { form: { password: PASSWORD }, failOnStatusCode: false, maxRedirects: 10, timeout: 60000 });
+
+            // Discover products through Shoplazza's native API using the origin domain.
+            const products = new Map();
+            const searchTerms = ['', 'mower', 'kayak', 'lift', 'bike', 'bicycle', 'generator', 'shed', 'swing', 'trampoline', 'gazebo', 'cardio', 'garden', 'home'];
+            const searchResponses = [];
+            for (const keyword of searchTerms) {
+              for (let requestedPage = 0; requestedPage < 15; requestedPage++) {
+                try {
+                  const response = await context.request.get(new URL('/api/search', ORIGIN).href, {
+                    params: { keyword, page: requestedPage, limit: 100 }, failOnStatusCode: false, timeout: 60000
+                  });
+                  const body = await response.text();
+                  searchResponses.push({ keyword, page: requestedPage, status: response.status(), length: body.length });
+                  if (response.status() >= 400) break;
+                  const payload = JSON.parse(body);
+                  const list = payload?.data?.products || [];
+                  for (const product of list) if (product.handle) products.set(product.handle, product);
+                  if (!list.length || !payload?.data?.has_more) break;
+                } catch { break; }
+                await sleep(250);
+              }
+            }
+
+            const page = await context.newPage();
+            const consoleErrors = [], pageErrors = [], failedRequests = [];
+            page.on('console', message => { if (message.type() === 'error') consoleErrors.push({ page: page.url(), text: message.text() }); });
+            page.on('pageerror', error => pageErrors.push({ page: page.url(), text: String(error.stack || error) }));
+            page.on('requestfailed', request => failedRequests.push({ page: page.url(), url: request.url(), reason: request.failure()?.errorText || '' }));
+
+            const routeRows = [];
+            const policyData = {};
+            const internalLinks = new Set();
+            const observedButtons = [];
+            const observedForms = [];
+
+            async function inspectRoute(route, screenshot = false) {
+              let response = null, navigationError = '';
+              try {
+                response = await page.goto(new URL(route, CUSTOM).href, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                await page.waitForLoadState('networkidle', { timeout: 25000 }).catch(() => {});
+                await sleep(route === '/' ? 2600 : 900);
+              } catch (error) { navigationError = String(error); }
+              if (screenshot) await page.screenshot({ path: `audit/screenshots/${safe(route)}.png`, fullPage: true }).catch(() => {});
+              const data = await page.evaluate(() => {
+                const visible = element => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+                const main = document.querySelector('main,#MainContent,[role="main"]') || document.body;
+                const images = [...document.images].map(image => ({ src: image.currentSrc || image.src, displayed: visible(image), complete: image.complete, naturalWidth: image.naturalWidth, naturalHeight: image.naturalHeight, alt: image.alt || '' }));
+                const links = [...document.querySelectorAll('a[href]')].map(link => ({ href: link.href, text: (link.innerText || link.getAttribute('aria-label') || '').replace(/\s+/g,' ').trim(), displayed: visible(link) }));
+                const buttons = [...document.querySelectorAll('button,input[type="submit"],input[type="button"],a[role="button"],.button,.btn')].map(button => ({ text: (button.innerText || button.value || button.getAttribute('aria-label') || '').replace(/\s+/g,' ').trim(), displayed: visible(button), disabled: !!button.disabled || button.getAttribute('aria-disabled') === 'true', href: button.href || '', form_action: button.form?.action || '', type: button.getAttribute('type') || '' }));
+                const forms = [...document.forms].map(form => ({ action: form.action, method: form.method, inputs: [...form.elements].map(element => ({ name: element.name, type: element.type, required: !!element.required })).filter(item => item.name) }));
+                const scripts = [...document.querySelectorAll('script[type="application/ld+json"]')].map(script => script.textContent || '');
+                return {
+                  title: document.title, h1: document.querySelector('h1')?.innerText?.trim() || '', h1_count: document.querySelectorAll('h1').length,
+                  meta_description: document.querySelector('meta[name="description"]')?.content || '', robots_meta: document.querySelector('meta[name="robots"]')?.content || '',
+                  canonical: document.querySelector('link[rel="canonical"]')?.href || '', lang: document.documentElement.lang || '',
+                  main_text: (main.innerText || '').replace(/\s+/g,' ').trim(), body_text: (document.body.innerText || '').replace(/\s+/g,' ').trim(),
+                  links, buttons, forms, jsonld: scripts,
+                  product_cards: document.querySelectorAll('[data-product-card],.vd-api-product-card,.vd-product-card,.shoplazza-product-snippet').length,
+                  broken_images: images.filter(image => image.displayed && (!image.complete || !image.naturalWidth)),
+                  image_count: images.length,
+                  empty_links: links.filter(link => !link.href || link.href.endsWith('#') || link.href.startsWith('javascript:')),
+                  horizontal_overflow: document.body.scrollWidth > document.body.clientWidth + 2
+                };
+              }).catch(error => ({ evaluation_error: String(error) }));
+              for (const link of data.links || []) if (sameStore(link.href)) internalLinks.add(normalize(link.href));
+              for (const button of data.buttons || []) observedButtons.push({ route, ...button });
+              for (const form of data.forms || []) observedForms.push({ route, action: form.action, method: form.method, inputs: JSON.stringify(form.inputs) });
+              const row = {
+                route, status: response?.status() || '', final_url: page.url(), navigation_error: navigationError,
+                title: data.title || '', h1: data.h1 || '', h1_count: data.h1_count ?? '', meta_description: data.meta_description || '', robots_meta: data.robots_meta || '', canonical: normalize(data.canonical || ''),
+                main_text_length: (data.main_text || '').length, product_cards: data.product_cards ?? '', broken_images: (data.broken_images || []).length, empty_links: (data.empty_links || []).length, horizontal_overflow: !!data.horizontal_overflow,
+                has_new_phone: (data.body_text || '').replace(/\D/g,'').includes(expected.phoneDigits), has_email: (data.body_text || '').toLowerCase().includes(expected.email), has_address: (data.body_text || '').toLowerCase().includes(expected.addressNeedle),
+                old_phone_512: /512\D*577\D*6043/.test(data.body_text || ''), old_brand: /\bibenry\b|ibenry\.com|ibenry group/i.test(data.body_text || '')
+              };
+              routeRows.push(row);
+              if (policyRoutes.includes(route)) policyData[route] = { ...row, text: data.main_text || '', body_text: data.body_text || '' };
+              return { response, data };
+            }
+
+            for (const route of routes) {
+              await inspectRoute(route, ['/', '/pages/contact-us', '/pages/order-status', '/collections/all-products', '/cart'].includes(route));
+            }
+
+            // Representative product browser sample.
+            const allProducts = [...products.values()].sort((a,b) => String(a.handle).localeCompare(String(b.handle)));
+            const sampleCount = Math.min(32, allProducts.length);
+            const sampledProducts = [];
+            for (let index = 0; index < sampleCount; index++) sampledProducts.push(allProducts[Math.floor(index * allProducts.length / sampleCount)]);
+            const productRows = [];
+            for (let index = 0; index < sampledProducts.length; index++) {
+              const product = sampledProducts[index];
+              const route = `/products/${product.handle}`;
+              try {
+                const response = await page.goto(new URL(route, CUSTOM).href, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+                await sleep(850);
+                if (index < 2) await page.screenshot({ path: `audit/screenshots/product-${index + 1}.png`, fullPage: true }).catch(() => {});
+                const data = await page.evaluate(() => {
+                  const visible = element => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+                  const meta = [...document.querySelectorAll('.vd-product-identity li,.vd-product-taxonomy li,.product-meta li,[data-product-meta]')].map(node => (node.innerText || '').replace(/\s+/g,' ').trim());
+                  const description = document.querySelector('[data-tab-panel="description"],.vd-product-description,.product-description,.rte');
+                  const gallery = document.querySelector('.vd-product-gallery,.product-gallery,[data-product-gallery]');
+                  const stage = gallery?.querySelector('.vd-product-stage,.product-main-image,[data-product-stage]');
+                  const images = [...document.images].map(image => ({ displayed: visible(image), complete: image.complete, naturalWidth: image.naturalWidth, src: image.currentSrc || image.src }));
+                  return {
+                    title: document.querySelector('h1')?.innerText?.trim() || '', meta,
+                    sku: [...document.querySelectorAll('[data-sku-value],[data-product-sku],.vd-product-sku,.sku')].map(node => (node.innerText || '').replace(/\s+/g,' ').trim()).filter(Boolean),
+                    prices: [...document.querySelectorAll('.vd-product-price,.price,[data-product-price],.money')].map(node => (node.innerText || '').replace(/\s+/g,' ').trim()).filter(Boolean).slice(0,8),
+                    description_words: (description?.innerText || '').trim().split(/\s+/).filter(Boolean).length,
+                    gallery: stage ? { width: stage.getBoundingClientRect().width, height: stage.getBoundingClientRect().height } : null,
+                    related_cards: document.querySelectorAll('[data-related-grid] [data-product-card],.vd-related [data-product-card],.related-products [data-product-card],.related-products .shoplazza-product-snippet').length,
+                    broken_images: images.filter(image => image.displayed && (!image.complete || !image.naturalWidth)).length,
+                    source_image_urls: images.filter(image => /ibenry\.com/i.test(image.src)).length,
+                    horizontal_overflow: document.body.scrollWidth > document.body.clientWidth + 2,
+                    add_to_cart: [...document.querySelectorAll('button')].some(button => /add to cart/i.test(button.innerText || '')),
+                    buy_now: [...document.querySelectorAll('button')].some(button => /buy now/i.test(button.innerText || '')),
+                    jsonld: [...document.querySelectorAll('script[type="application/ld+json"]')].map(script => script.textContent || '')
+                  };
+                });
+                let structured = {};
+                for (const raw of data.jsonld || []) {
+                  try {
+                    const parsed = JSON.parse(raw);
+                    const stack = Array.isArray(parsed) ? [...parsed] : [parsed];
+                    while (stack.length) {
+                      const node = stack.pop();
+                      if (Array.isArray(node)) { stack.push(...node); continue; }
+                      if (!node || typeof node !== 'object') continue;
+                      const types = Array.isArray(node['@type']) ? node['@type'] : [node['@type']];
+                      if (types.includes('Product')) { structured = node; stack.length = 0; break; }
+                      for (const value of Object.values(node)) if (value && typeof value === 'object') stack.push(value);
+                    }
+                  } catch {}
+                  if (structured['@type']) break;
+                }
+                const offers = structured.offers || {};
+                const offer = Array.isArray(offers) ? offers[0] || {} : offers;
+                productRows.push({
+                  route, status: response?.status() || '', page_title: data.title, api_title: product.title || '', displayed_sku: data.sku.join(' | '), api_sku: product.sku || '',
+                  category_present: /Category\s*:/i.test(data.meta.join(' ')), brand_present: /Brand\s*:/i.test(data.meta.join(' ')), metadata_text: data.meta.join(' | '),
+                  displayed_prices: data.prices.join(' | '), api_price: product.price ?? '', api_compare_at_price: product.compare_at_price ?? '',
+                  structured_sku: structured.sku || '', structured_brand: typeof structured.brand === 'object' ? structured.brand?.name || '' : structured.brand || '', structured_price: offer.price || offer.lowPrice || '', structured_availability: offer.availability || '',
+                  description_words: data.description_words, gallery_width: data.gallery?.width || '', gallery_height: data.gallery?.height || '', related_cards: data.related_cards,
+                  broken_images: data.broken_images, source_image_urls: data.source_image_urls, horizontal_overflow: data.horizontal_overflow, add_to_cart: data.add_to_cart, buy_now: data.buy_now
+                });
+              } catch (error) { productRows.push({ route, error: String(error) }); }
+            }
+
+            // Check every discovered product route by HTTP with throttled concurrency.
+            const productRouteRows = [];
+            let productCursor = 0;
+            async function productWorker() {
+              while (productCursor < allProducts.length) {
+                const product = allProducts[productCursor++];
+                const route = `/products/${product.handle}`;
+                try {
+                  const response = await context.request.get(new URL(route, CUSTOM).href, { failOnStatusCode: false, maxRedirects: 8, timeout: 45000 });
+                  productRouteRows.push({ route, status: response.status(), final_url: response.url() });
+                } catch (error) { productRouteRows.push({ route, error: String(error) }); }
+                await sleep(80);
+              }
+            }
+            await Promise.all(Array.from({ length: 6 }, () => productWorker()));
+
+            // Internal-link status crawl.
+            const linkRows = [];
+            const links = [...internalLinks].slice(0, 1800);
+            let linkCursor = 0;
+            async function linkWorker() {
+              while (linkCursor < links.length) {
+                const href = links[linkCursor++];
+                try {
+                  const target = href.includes('vardentra.myshoplaza.com') ? href : normalize(href, CUSTOM);
+                  const response = await context.request.get(target, { failOnStatusCode: false, maxRedirects: 10, timeout: 30000 });
+                  linkRows.push({ href: cleanLink(target), status: response.status(), final_url: cleanLink(response.url()), content_type: response.headers()['content-type'] || '' });
+                } catch (error) { linkRows.push({ href: cleanLink(href), error: String(error) }); }
+                await sleep(40);
+              }
+            }
+            const cleanLink = value => normalize(value || '', CUSTOM);
+            await Promise.all(Array.from({ length: 8 }, () => linkWorker()));
+
+            // Safe functional tests.
+            const interactions = [];
+            async function test(name, fn) {
+              try { interactions.push({ name, status: 'PASS', details: JSON.stringify(await fn() || {}) }); }
+              catch (error) { interactions.push({ name, status: 'FAIL', details: String(error.stack || error) }); }
+            }
+            const simpleProduct = allProducts.find(product => product.available !== false && (product.variants || []).length <= 1) || allProducts[0];
+            const testRoute = `/products/${simpleProduct?.handle || ''}`;
+            const goto = async (route, delay = 650) => { const response = await page.goto(new URL(route, CUSTOM).href, { waitUntil: 'domcontentloaded', timeout: 90000 }); await page.waitForLoadState('networkidle', { timeout: 18000 }).catch(() => {}); await sleep(delay); return response; };
+
+            await test('Homepage product merchandising', async () => { await goto('/', 1800); const cards = await page.locator('[data-product-card],.vd-api-product-card,.vd-product-card,.shoplazza-product-snippet').count(); if (cards < 8) throw new Error(`Only ${cards} product cards`); return { cards }; });
+            await test('Header Shop link', async () => { await goto('/'); const link = page.getByRole('link', { name: /^shop$/i }).first(); if (!await link.count()) throw new Error('Shop link missing'); const href = await link.getAttribute('href'); await link.click(); await page.waitForLoadState('domcontentloaded'); if (!page.url().includes('/collections/')) throw new Error(page.url()); return { href, final_url: page.url() }; });
+            await test('Search submission', async () => { await goto('/'); const input = page.locator('input[type="search"],input[name="q"],input[placeholder*="Search" i]').first(); if (!await input.count()) throw new Error('Search input missing'); await input.fill('mower'); await input.press('Enter'); await page.waitForLoadState('domcontentloaded'); await sleep(900); const cards = await page.locator('[data-product-card],.vd-api-product-card,.vd-product-card,.shoplazza-product-snippet').count(); if (!page.url().includes('/search') || !cards) throw new Error(`url=${page.url()} cards=${cards}`); return { final_url: page.url(), cards }; });
+            await test('Collection pagination', async () => { await goto('/collections/all-products'); const next = page.locator('.vd-pagination a[rel="next"],a[aria-label*="next" i],.pagination a:has-text("Next")').first(); if (!await next.count()) throw new Error('Next link missing'); const href = await next.getAttribute('href'); await next.click(); await page.waitForLoadState('domcontentloaded'); return { href, final_url: page.url() }; });
+            await test('Product metadata', async () => { await goto(testRoute); const text = clean(await page.locator('.vd-product-identity,.vd-product-taxonomy,.product-meta,[data-product-meta]').first().innerText().catch(() => '')); if (!/SKU\s*:/i.test(text) || !/Category\s*:/i.test(text) || !/Brand\s*:/i.test(text)) throw new Error(text); return { text }; });
+            await test('Product tabs', async () => { await goto(testRoute); const tabs = page.locator('[data-tab-button]'); if (await tabs.count() < 3) throw new Error('Expected 3 tabs'); await tabs.nth(1).click(); await tabs.nth(2).click(); return { count: await tabs.count() }; });
+            await test('Quantity increase', async () => { await goto(testRoute); const input = page.locator('input[name="quantity"],input[type="number"]').first(); const plus = page.locator('[data-quantity-plus],button[aria-label*="increase" i],button:has-text("+")').first(); if (!await input.count() || !await plus.count()) throw new Error('Controls missing'); const before = Number(await input.inputValue()); await plus.click(); const after = Number(await input.inputValue()); if (!(after > before)) throw new Error(`${before}->${after}`); return { before, after }; });
+            await test('Add to Cart and remove', async () => { await goto(testRoute); const add = page.getByRole('button', { name: /add to cart/i }).first(); if (!await add.count() || await add.isDisabled()) throw new Error('Add to Cart missing/disabled'); await add.click(); await sleep(1200); await goto('/cart'); const body = clean(await page.locator('body').innerText()); if (/cart is empty|your cart is empty/i.test(body)) throw new Error('Cart empty'); const remove = page.locator('[data-cart-remove],button[aria-label*="remove" i],a[aria-label*="remove" i],button:has-text("Remove"),a:has-text("Remove")').first(); const found = await remove.count(); if (found) await remove.click(); return { added: true, remove_control: !!found }; });
+            await test('Buy Now visible', async () => { await goto(testRoute); const buy = page.getByRole('button', { name: /buy now/i }).first(); if (!await buy.count() || await buy.isDisabled()) throw new Error('Buy Now missing/disabled'); return await buy.evaluate(button => ({ visible: !!(button.offsetWidth || button.offsetHeight), form_action: button.form?.action || '', type: button.type || '' })); });
+            await test('Wishlist toggle', async () => { await goto(testRoute); const button = page.getByRole('button', { name: /wishlist/i }).first(); if (!await button.count()) throw new Error('Wishlist missing'); const before = await button.getAttribute('aria-pressed'); await button.click(); const after = await button.getAttribute('aria-pressed'); return { before, after }; });
+            await test('Compare toggle', async () => { await goto(testRoute); const button = page.getByRole('button', { name: /compare/i }).first(); if (!await button.count()) throw new Error('Compare missing'); const before = await button.getAttribute('aria-pressed'); await button.click(); const after = await button.getAttribute('aria-pressed'); return { before, after }; });
+            await test('Order Status form', async () => { await goto('/pages/order-status'); const form = page.locator('form[action*="order_verify"],form:has(input[name="order_number"])').first(); if (!await form.count()) throw new Error('Order form missing'); const email = form.locator('input[name="email"]'); const order = form.locator('input[name="order_number"]'); if (!await email.count() || !await order.count()) throw new Error('Required fields missing'); return { action: await form.getAttribute('action'), email_required: await email.getAttribute('required') !== null, order_required: await order.getAttribute('required') !== null }; });
+
+            const mobile = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, storageState: await context.storageState(), ignoreHTTPSErrors: true });
+            const mobilePage = await mobile.newPage();
+            await test('Mobile menu', async () => { await mobilePage.goto(CUSTOM.href, { waitUntil: 'domcontentloaded', timeout: 90000 }); await sleep(900); const trigger = mobilePage.locator('[data-mobile-menu-trigger],button[aria-label*="menu" i],.mobile-menu-trigger').first(); if (!await trigger.count()) throw new Error('Menu trigger missing'); await trigger.click(); const shop = mobilePage.getByRole('link', { name: /^shop$/i }).first(); if (!await shop.count()) throw new Error('Mobile Shop missing'); await mobilePage.screenshot({ path: 'audit/screenshots/mobile-home.png', fullPage: true }).catch(() => {}); return { shop: await shop.getAttribute('href') }; });
+            await mobile.close();
+
+            // Policy consistency heuristics.
+            const legalFindings = [];
+            const low = Object.fromEntries(Object.entries(policyData).map(([route,data]) => [route, clean(data.text).toLowerCase()]));
+            const pages = regex => Object.entries(low).filter(([,text]) => regex.test(text)).map(([route]) => route);
+            const addFinding = (severity, issue, routes, evidence) => legalFindings.push({ severity, issue, pages: [...new Set(routes)].join(' | '), evidence });
+            const oldIdentity = pages(/ibenry|ibenry group|ibenry\.com|contact@ibenry|1550 blairs ferry|319[\s\-.()]*305[\s\-.]*8352|512[\s\-.()]*577[\s\-.]*6043/i); if (oldIdentity.length) addFinding('CRITICAL','Old identity or telephone remains',oldIdentity,'Legacy identity/contact text detected');
+            const platform = pages(/wordpress|woocommerce|shopify/i); if (platform.length) addFinding('HIGH','Wrong platform reference',platform,'Legacy platform wording detected');
+            const intl = pages(/international (delivery|shipping)|outside the united states|ship internationally/i), usOnly = pages(/united states only|only ship within the united states|ship only to/i); if (intl.length && usOnly.length) addFinding('HIGH','Shipping destination conflict',[...intl,...usOnly],'International and U.S.-only language coexist');
+            const free = pages(/free (standard )?shipping|shipping is free/i), calculated = pages(/shipping (is|will be) calculated at checkout|calculated at checkout/i); if (free.length && calculated.length) addFinding('HIGH','Shipping cost conflict',[...free,...calculated],'Free and calculated-at-checkout wording coexist');
+            const unused = pages(/must be unused|unused.{0,80}original/i), used = pages(/slightly used|gently used|used products/i); if (unused.length && used.length) addFinding('HIGH','Return-condition conflict',[...unused,...used],'Unused-only and used-product return language coexist');
+            const warranty = pages(/three-year warranty|3-year warranty/i); if (warranty.length) addFinding('HIGH','Blanket three-year warranty requires proof',warranty,'Store-wide three-year warranty detected');
+            const bounty = pages(/bounty|cash reward|safe harbor|reward up to/i); if (bounty.length) addFinding('HIGH','Security bounty/safe-harbor promise requires active program',bounty,'Reward or safe-harbor wording detected');
+            const absolutes = pages(/100% (safe|secure)|level 1 pci|pci dss|128-bit ssl|guaranteed secure/i); if (absolutes.length) addFinding('MEDIUM','Absolute security/compliance claim requires verification',absolutes,'Absolute security, PCI or SSL wording detected');
+            for (const [route,data] of Object.entries(policyData)) {
+              const text = clean(data.text).toLowerCase();
+              if (['/pages/contact-us','/pages/privacy-policy','/pages/terms-of-service','/pages/shipping-policy','/pages/refund-and-returns-policy','/pages/billing-policy'].includes(route) && !text.includes(expected.email)) addFinding('HIGH','Support email missing',[route],expected.email);
+              if (route === '/pages/contact-us' && !text.replace(/\D/g,'').includes(expected.phoneDigits)) addFinding('HIGH','Final phone missing from Contact page',[route],expected.phoneDisplay);
+              if (route === '/pages/contact-us' && !text.includes(expected.addressNeedle)) addFinding('HIGH','Final address missing from Contact page',[route],expected.address);
+            }
+
+            const titleGroups = {}, descriptionGroups = {};
+            for (const row of routeRows.filter(row => row.status === 200)) {
+              if (row.title) (titleGroups[row.title] ||= []).push(row.route);
+              if (row.meta_description) (descriptionGroups[row.meta_description] ||= []).push(row.route);
+            }
+            const duplicateTitles = Object.entries(titleGroups).filter(([,routes]) => routes.length > 1);
+            const duplicateDescriptions = Object.entries(descriptionGroups).filter(([,routes]) => routes.length > 1);
+
+            const summary = {
+              audited_at: new Date().toISOString(), custom_domain: CUSTOM.href, origin: ORIGIN.href,
+              preauth, auth_custom_status: authCustom.status(), auth_origin_status: authOrigin.status(),
+              products_discovered: allProducts.length, routes_checked: routeRows.length, broken_core_routes: routeRows.filter(row => Number(row.status) >= 400 || row.navigation_error).length,
+              product_routes_checked: productRouteRows.length, product_route_status_counts: productRouteRows.reduce((acc,row) => { const key = String(row.status || 'error'); acc[key] = (acc[key] || 0) + 1; return acc; }, {}),
+              internal_links_checked: linkRows.length, broken_internal_links: linkRows.filter(row => Number(row.status) >= 400 || row.error).length,
+              product_pages_sampled: productRows.length, product_missing_sku: productRows.filter(row => !row.displayed_sku).map(row => row.route), product_missing_category: productRows.filter(row => !row.category_present).map(row => row.route), product_missing_brand: productRows.filter(row => !row.brand_present).map(row => row.route),
+              product_short_descriptions: productRows.filter(row => Number(row.description_words) < 20).map(row => row.route), product_non_square_gallery: productRows.filter(row => row.gallery_width && Math.abs(Number(row.gallery_width) - Number(row.gallery_height)) > 8).map(row => row.route), product_missing_related: productRows.filter(row => Number(row.related_cards) === 0).map(row => row.route), product_broken_images: productRows.reduce((count,row) => count + Number(row.broken_images || 0), 0), product_source_image_urls: productRows.reduce((count,row) => count + Number(row.source_image_urls || 0), 0),
+              core_broken_images: routeRows.reduce((count,row) => count + Number(row.broken_images || 0), 0), core_horizontal_overflow: routeRows.filter(row => row.horizontal_overflow).map(row => row.route),
+              new_phone_missing_routes: routeRows.filter(row => ['/','/pages/contact-us','/pages/privacy-policy','/pages/terms-of-service','/pages/shipping-policy','/pages/refund-and-returns-policy','/pages/billing-policy'].includes(row.route) && !row.has_new_phone).map(row => row.route),
+              old_phone_routes: routeRows.filter(row => row.old_phone_512).map(row => row.route), old_brand_routes: routeRows.filter(row => row.old_brand).map(row => row.route),
+              interaction_pass: interactions.filter(row => row.status === 'PASS').length, interaction_fail: interactions.filter(row => row.status === 'FAIL').length,
+              legal_findings: legalFindings.length, duplicate_titles: duplicateTitles.length, duplicate_meta_descriptions: duplicateDescriptions.length,
+              console_errors: consoleErrors.length, page_errors: pageErrors.length, failed_requests: failedRequests.length
+            };
+
+            writeCsv('audit/routes.csv', routeRows);
+            writeCsv('audit/products.csv', productRows);
+            writeCsv('audit/product-routes.csv', productRouteRows);
+            writeCsv('audit/links.csv', linkRows);
+            writeCsv('audit/interactions.csv', interactions);
+            writeCsv('audit/legal-findings.csv', legalFindings);
+            writeCsv('audit/buttons-observed.csv', observedButtons);
+            writeCsv('audit/forms-observed.csv', observedForms);
+            fs.writeFileSync('audit/policies.json', JSON.stringify(policyData, null, 2));
+            fs.writeFileSync('audit/results.json', JSON.stringify({ summary, routeRows, productRows, productRouteRows, linkRows, interactions, legalFindings, duplicateTitles, duplicateDescriptions, observedButtons, observedForms, consoleErrors, pageErrors, failedRequests, searchResponses }, null, 2));
+            fs.writeFileSync('audit/REPORT.md', ['# Vardentra final GMC readiness audit','',`Audited: ${summary.audited_at}`,'',`Products discovered: ${summary.products_discovered}`,`Core routes checked: ${summary.routes_checked}`,`Broken core routes: ${summary.broken_core_routes}`,`Product routes checked: ${summary.product_routes_checked}`,`Internal links checked: ${summary.internal_links_checked}`,`Broken internal links: ${summary.broken_internal_links}`,`Interaction passes: ${summary.interaction_pass}`,`Interaction failures: ${summary.interaction_fail}`,`Legal findings: ${summary.legal_findings}`,`Duplicate titles: ${summary.duplicate_titles}`,`Duplicate descriptions: ${summary.duplicate_meta_descriptions}`,'',...interactions.map(row => `- ${row.name}: ${row.status} — ${row.details}`),'',...legalFindings.map(row => `- ${row.severity}: ${row.issue} — ${row.pages} — ${row.evidence}`)].join('\n') + '\n');
+
+            await context.close();
+            await browser.close();
+          })().catch(error => { fs.mkdirSync('audit',{recursive:true}); fs.writeFileSync('audit/FATAL.txt',String(error.stack || error)); process.exitCode = 1; });
+          JS
+          node audit.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vardentra-gmc-final-audit-20260812
+          path: audit/
+          retention-days: 1
+          compression-level: 6
