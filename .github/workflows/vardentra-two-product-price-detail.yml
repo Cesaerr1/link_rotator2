@@ -1,0 +1,87 @@
+name: Vardentra two-product price detail audit
+
+on:
+  push:
+    branches:
+      - agent/vardentra-two-product-price-detail-20260814
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install cheerio
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install cheerio@1.0.0 >/dev/null 2>&1
+      - name: Inspect product and variant prices
+        shell: bash
+        run: |
+          mkdir -p audit
+          cat > audit.js <<'JS'
+          const cheerio = require('cheerio');
+          const fs = require('fs');
+          const BASE='https://www.vardentra.com';
+          const ORIGIN='https://vardentra.myshoplaza.com';
+          const handles=[
+            'vibe-kayaks-makana-100-pedal-fishing-kayak',
+            'wilderness-systems-recon-120-hd-fishing-kayak-with-airpro-aces-seat'
+          ];
+          const num=value=>{if(value===null||value===undefined||value==='')return null;const n=Number(String(value).replace(/[$,\s]/g,''));return Number.isFinite(n)?n:null};
+          const clean=value=>String(value||'').replace(/\s+/g,' ').trim();
+          const equal=(a,b)=>a!==null&&b!==null&&Math.abs(a-b)<0.005;
+          function walk(node,cb){if(Array.isArray(node))return node.forEach(x=>walk(x,cb));if(!node||typeof node!=='object')return;cb(node);for(const v of Object.values(node))if(v&&typeof v==='object')walk(v,cb)}
+          function parseHtml(html){
+            const $=cheerio.load(html);let productJson={};
+            try{productJson=JSON.parse($('#product-json').text()||'{}')}catch{}
+            const productNodes=[];
+            $('script[type="application/ld+json"]').each((_,s)=>{try{const parsed=JSON.parse($(s).text());walk(parsed,node=>{const t=node['@type'];const ts=Array.isArray(t)?t:[t];if(ts.includes('Product')||ts.includes('ProductGroup'))productNodes.push(node)})}catch{}});
+            const node=productNodes[0]||{};const offers=Array.isArray(node.offers)?node.offers[0]||{}:node.offers||{};const spec=offers.priceSpecification||{};
+            const prices=[];for(const selector of ['.vd-product-price','.product-info__price','[data-product-price]','.product-price','.price']){$(selector).each((_,el)=>{const ms=clean($(el).text()).match(/[0-9][0-9,]*(?:\.[0-9]{1,4})?/g)||[];for(const m of ms){const n=num(m);if(n!==null&&!prices.includes(n))prices.push(n)}})}
+            return{selected:productJson.selected||{},product:productJson.product||{},jsonld:{sku:node.sku||'',price:num(offers.price??spec.price??offers.lowPrice),currency:offers.priceCurrency||spec.priceCurrency||'',availability:offers.availability||''},visible_prices:prices};
+          }
+          async function searchProduct(handle){
+            const terms=[handle.replace(/-/g,' '),handle.split('-').slice(0,5).join(' ')];
+            for(const keyword of terms){
+              for(let page=0;page<10;page++){
+                const url=new URL('/api/search',ORIGIN);url.searchParams.set('keyword',keyword);url.searchParams.set('page',page);url.searchParams.set('limit','100');
+                const res=await fetch(url);if(!res.ok)break;const j=await res.json();const list=j?.data?.products||[];const found=list.find(p=>p.handle===handle);if(found)return found;if(!list.length||!j?.data?.has_more)break;
+              }
+            }
+            return null;
+          }
+          (async()=>{
+            const report=[];
+            for(const handle of handles){
+              const api=await searchProduct(handle);
+              if(!api){report.push({handle,error:'API product not found'});continue}
+              const parentHtml=await (await fetch(`${BASE}/products/${handle}`)).text();const parent=parseHtml(parentHtml);
+              const variants=(api.variants||[]).map(v=>({id:v.id||v.variant_id,sku:v.sku||'',price:num(v.price),available:v.available,options:v.options||v.option_values||v.attributes||[]}));
+              const prices=variants.map(v=>v.price).filter(v=>v!==null);
+              const productResult={handle,api_parent:{id:api.id,title:api.title,price:num(api.price),sku:api.sku||'',available:api.available},variant_summary:{count:variants.length,min_price:prices.length?Math.min(...prices):null,max_price:prices.length?Math.max(...prices):null,first:variants[0]||null,last:variants[variants.length-1]||null},parent_page:{selected_id:parent.selected.id||parent.selected.variant_id||'',selected_sku:parent.selected.sku||'',selected_price:num(parent.selected.price),selected_available:parent.selected.available,jsonld:parent.jsonld,visible_prices:parent.visible_prices},variants:[]};
+              for(const variant of variants){
+                if(!variant.id)continue;const html=await (await fetch(`${BASE}/products/${handle}?variant=${encodeURIComponent(variant.id)}`)).text();const parsed=parseHtml(html);productResult.variants.push({variant_id:variant.id,api_sku:variant.sku,api_price:variant.price,api_available:variant.available,page_selected_id:parsed.selected.id||parsed.selected.variant_id||'',page_selected_sku:parsed.selected.sku||'',page_selected_price:num(parsed.selected.price),page_selected_available:parsed.selected.available,jsonld_price:parsed.jsonld.price,jsonld_currency:parsed.jsonld.currency,jsonld_availability:parsed.jsonld.availability,visible_prices:parsed.visible_prices,price_match:equal(parsed.jsonld.price,variant.price),selected_match:equal(num(parsed.selected.price),variant.price)});await new Promise(r=>setTimeout(r,120));
+              }
+              report.push(productResult);
+            }
+            fs.writeFileSync('audit/details.json',JSON.stringify(report,null,2));
+            const lines=['# Vardentra two-product price detail audit',''];
+            for(const p of report){
+              if(p.error){lines.push(`## ${p.handle}`,`- ${p.error}`,'');continue}
+              lines.push(`## ${p.handle}`,'',`- API parent price: **${p.api_parent.price}**`,`- Variant range: **${p.variant_summary.min_price}–${p.variant_summary.max_price}**`,`- Default selected variant: **${p.parent_page.selected_id} / ${p.parent_page.selected_sku} / ${p.parent_page.selected_price}**`,`- Parent visible prices: **${p.parent_page.visible_prices.join(' | ')}**`,`- Parent JSON-LD: **${p.parent_page.jsonld.price} ${p.parent_page.jsonld.currency} / ${p.parent_page.jsonld.availability}**`,`- All variant URLs matching API price: **${p.variants.every(v=>v.price_match&&v.selected_match)}**`,'');
+            }
+            fs.writeFileSync('audit/REPORT.md',lines.join('\n')+'\n');
+          })().catch(e=>{fs.writeFileSync('audit/FATAL.txt',String(e.stack||e));process.exitCode=1});
+          JS
+          node audit.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vardentra-two-product-price-detail-20260814
+          path: audit/
+          retention-days: 1
+          compression-level: 6
