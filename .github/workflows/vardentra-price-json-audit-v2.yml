@@ -1,0 +1,301 @@
+name: Vardentra live price JSON audit v2
+
+on:
+  push:
+    branches:
+      - agent/vardentra-price-json-audit-v2-20260814
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install playwright@1.55.0 cheerio@1.0.0 >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null
+      - name: Audit live prices and structured data
+        shell: bash
+        run: |
+          mkdir -p audit/screenshots
+          cat > audit.js <<'JS'
+          const { chromium } = require('playwright');
+          const cheerio = require('cheerio');
+          const fs = require('fs');
+
+          const BASE = new URL('https://www.vardentra.com/');
+          const ORIGIN = new URL('https://vardentra.myshoplaza.com/');
+          const EPSILON = 0.005;
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+          const safe = value => value.replace(/^\//,'').replace(/[?&#=/]+/g,'-').replace(/-+$/,'').slice(0,140) || 'page';
+          const toNumber = value => {
+            if (value === null || value === undefined || value === '') return null;
+            const parsed = Number(String(value).replace(/[$,\s]/g,''));
+            return Number.isFinite(parsed) ? parsed : null;
+          };
+          const equalMoney = (left, right) => left !== null && right !== null && Math.abs(left - right) < EPSILON;
+          const availabilityBool = value => {
+            const text = String(value || '').toLowerCase();
+            if (/instock|limitedavailability|onlineonly/.test(text)) return true;
+            if (/outofstock|soldout|discontinued|instoreonly/.test(text)) return false;
+            return null;
+          };
+          const writeCsv = (file, rows) => {
+            if (!rows.length) return fs.writeFileSync(file,'');
+            const headers = [...new Set(rows.flatMap(row => Object.keys(row)))];
+            const escape = value => {
+              const text = typeof value === 'object' ? JSON.stringify(value) : String(value ?? '');
+              return /[",\n]/.test(text) ? `"${text.replace(/"/g,'""')}"` : text;
+            };
+            fs.writeFileSync(file,[headers.map(escape).join(','),...rows.map(row=>headers.map(h=>escape(row[h])).join(','))].join('\n')+'\n');
+          };
+          function walk(node, callback) {
+            if (Array.isArray(node)) return node.forEach(item => walk(item, callback));
+            if (!node || typeof node !== 'object') return;
+            callback(node);
+            for (const value of Object.values(node)) if (value && typeof value === 'object') walk(value, callback);
+          }
+          function jsonProductNodes(html) {
+            const $ = cheerio.load(html);
+            const nodes = [];
+            $('script[type="application/ld+json"]').each((_, script) => {
+              try {
+                const parsed = JSON.parse($(script).text());
+                walk(parsed, node => {
+                  const type = node['@type'];
+                  const types = Array.isArray(type) ? type : [type];
+                  if (types.includes('Product') || types.includes('ProductGroup')) nodes.push(node);
+                });
+              } catch {}
+            });
+            return nodes;
+          }
+          function offer(node) {
+            const value = node?.offers;
+            if (Array.isArray(value)) return value[0] || {};
+            return value || {};
+          }
+          function htmlPriceCandidates(html) {
+            const $ = cheerio.load(html);
+            const values = [];
+            const add = value => {
+              const parsed = toNumber(value);
+              if (parsed !== null && parsed >= 0 && !values.includes(parsed)) values.push(parsed);
+            };
+            for (const selector of ['meta[property="product:price:amount"]','meta[property="og:price:amount"]','meta[itemprop="price"]','[itemprop="price"]','[data-product-price]','.vd-product-price','.product-info__price','.product-price','.price']) {
+              $(selector).each((_, element) => {
+                add($(element).attr('content'));
+                const matches = clean($(element).text()).match(/[0-9][0-9,]*(?:\.[0-9]{1,4})?/g) || [];
+                for (const match of matches) add(match);
+              });
+            }
+            return values;
+          }
+          const closest = (values, target) => !values.length ? null : target === null ? values[0] : [...values].sort((a,b)=>Math.abs(a-target)-Math.abs(b-target))[0];
+          async function getWithRetry(context, url, attempts = 5) {
+            let last = null;
+            for (let attempt = 1; attempt <= attempts; attempt++) {
+              try {
+                last = await context.request.get(url,{failOnStatusCode:false,maxRedirects:8,timeout:60000});
+                if (last.status() !== 429 && last.status() < 500) return last;
+              } catch {}
+              await sleep(600 * attempt * attempt);
+            }
+            return last;
+          }
+
+          (async () => {
+            const browser = await chromium.launch({headless:true});
+            const context = await browser.newContext({
+              viewport:{width:1440,height:1050},ignoreHTTPSErrors:true,locale:'en-US',
+              userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+            });
+
+            // Discover the current live catalogue through Shoplazza's native API.
+            const products = new Map();
+            const keywords = ['', 'mower','kayak','lift','bike','bicycle','generator','shed','swing','trampoline','gazebo','cardio','garden','home','portable','pressure washer','fire pit'];
+            const apiResponses = [];
+            for (const keyword of keywords) {
+              for (let page = 0; page < 20; page++) {
+                try {
+                  const url = new URL('/api/search', ORIGIN);
+                  url.searchParams.set('keyword',keyword);
+                  url.searchParams.set('page',String(page));
+                  url.searchParams.set('limit','100');
+                  const response = await context.request.get(url.href,{failOnStatusCode:false,timeout:60000});
+                  const body = await response.text();
+                  apiResponses.push({keyword,page,status:response.status(),length:body.length});
+                  if (response.status() >= 400) break;
+                  const payload = JSON.parse(body);
+                  const list = payload?.data?.products || [];
+                  for (const product of list) if (product.handle) products.set(product.handle,product);
+                  if (!list.length || !payload?.data?.has_more) break;
+                } catch { break; }
+                await sleep(100);
+              }
+            }
+
+            const criticalHandles = [
+              'ryobi-48v-hp-brushless-54-inch-115-ah-battery-electric-riding-zero-turn-mower-2',
+              'stihl-rz-560-k-commercial-60-zero-turn-lawn-mower-2',
+              'hobie-mirage-itrek-angler-10-inflatable-fishing-kayak',
+              'global-industrial-electric-walk-behind-auto-floor-scrubber-18-cleaning-path-2',
+              'predator-4400-psi-4-2-gpm-13-hp-420cc-commercial-duty-pressure-washer-epa-2',
+              'the-outdoor-plus-84-del-mar-concrete-gas-fire-pit'
+            ];
+            const allProducts = [...products.values()].sort((a,b)=>String(a.handle).localeCompare(String(b.handle)));
+            for (const handle of criticalHandles) if (!products.has(handle)) allProducts.push({handle,critical:true});
+
+            // Server HTML + JSON-LD scan.
+            const productRows = [];
+            let cursor = 0;
+            async function worker() {
+              while (cursor < allProducts.length) {
+                const product = allProducts[cursor++];
+                const row = {
+                  handle:product.handle,
+                  critical:criticalHandles.includes(product.handle),
+                  api_id:product.id||'',api_title:product.title||'',api_sku:product.sku||'',
+                  api_price:toNumber(product.price),api_currency:product.currency||product.price_currency||'USD',
+                  api_available:product.available===undefined?'':!!product.available,
+                  api_variant_count:Array.isArray(product.variants)?product.variants.length:0
+                };
+                try {
+                  const url = new URL(`/products/${product.handle}`,BASE).href;
+                  const response = await getWithRetry(context,url);
+                  if (!response) throw new Error('No response after retries');
+                  row.http_status=response.status();row.final_url=response.url();
+                  const html=await response.text();row.html_length=html.length;
+                  const nodes=jsonProductNodes(html);row.product_jsonld_count=nodes.length;
+                  const node=nodes.find(item=>String(item.url||'').includes(product.handle))||nodes[0]||{};
+                  const itemOffer=offer(node);const spec=itemOffer.priceSpecification||{};
+                  row.jsonld_price=toNumber(itemOffer.price??spec.price??itemOffer.lowPrice);
+                  row.jsonld_currency=itemOffer.priceCurrency||spec.priceCurrency||'';
+                  row.jsonld_availability=itemOffer.availability||'';
+                  row.jsonld_available=availabilityBool(row.jsonld_availability);
+                  row.jsonld_sku=node.sku||'';
+                  const candidates=htmlPriceCandidates(html);
+                  row.initial_html_candidates=candidates.join(' | ');
+                  row.initial_html_price=closest(candidates,row.api_price);
+                  row.jsonld_matches_api=row.api_price===null?'':equalMoney(row.jsonld_price,row.api_price);
+                  row.initial_html_matches_api=row.api_price===null||row.initial_html_price===null?'':equalMoney(row.initial_html_price,row.api_price);
+                  row.currency_matches_api=!row.jsonld_currency||!row.api_currency?'':String(row.jsonld_currency).toUpperCase()===String(row.api_currency).toUpperCase();
+                  row.availability_matches_api=row.api_available===''||row.jsonld_available===null?'':row.api_available===row.jsonld_available;
+                  row.old_100x_pattern=row.api_price!==null&&row.jsonld_price!==null&&Math.abs(row.jsonld_price*100-row.api_price)<0.02;
+                  row.pass=row.http_status===200&&row.product_jsonld_count>0&&row.jsonld_matches_api!==false&&row.initial_html_matches_api!==false&&row.currency_matches_api!==false&&row.availability_matches_api!==false&&!row.old_100x_pattern;
+                } catch (error) { row.error=String(error.stack||error);row.pass=false; }
+                productRows.push(row);
+                await sleep(90);
+              }
+            }
+            await Promise.all(Array.from({length:6},()=>worker()));
+            productRows.sort((a,b)=>String(a.handle).localeCompare(String(b.handle)));
+
+            // Browser-rendered sample including all historically mismatched pages.
+            const page = await context.newPage();
+            const browserProducts=[];
+            for(const handle of criticalHandles) browserProducts.push(products.get(handle)||{handle,critical:true});
+            const remaining=allProducts.filter(product=>!criticalHandles.includes(product.handle));
+            const extra=Math.min(18,remaining.length);
+            for(let i=0;i<extra;i++) browserProducts.push(remaining[Math.floor(i*remaining.length/extra)]);
+            const browserRows=[];
+            for(let index=0;index<browserProducts.length;index++){
+              const product=browserProducts[index];
+              const row={handle:product.handle,api_price:toNumber(product.price),api_available:product.available===undefined?'':!!product.available};
+              try{
+                const response=await page.goto(new URL(`/products/${product.handle}`,BASE).href,{waitUntil:'domcontentloaded',timeout:90000});
+                await page.waitForLoadState('networkidle',{timeout:20000}).catch(()=>{});await sleep(850);
+                if(index<6)await page.screenshot({path:`audit/screenshots/${index+1}-${safe(product.handle)}.png`,fullPage:true}).catch(()=>{});
+                const data=await page.evaluate(()=>{
+                  const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);
+                  const prices=[];
+                  for(const selector of ['.vd-product-price','.product-info__price','[data-product-price]','.product-price','.price','.money']){
+                    for(const element of document.querySelectorAll(selector)){
+                      if(!visible(element))continue;
+                      const matches=(element.innerText||element.textContent||'').match(/[0-9][0-9,]*(?:\.[0-9]{1,4})?/g)||[];
+                      for(const match of matches){const value=Number(match.replace(/,/g,''));if(Number.isFinite(value)&&!prices.includes(value))prices.push(value)}
+                    }
+                  }
+                  const scripts=[...document.querySelectorAll('script[type="application/ld+json"]')].map(script=>script.textContent||'');
+                  const add=[...document.querySelectorAll('button')].find(button=>/add to cart/i.test(button.innerText||''));
+                  const buy=[...document.querySelectorAll('button')].find(button=>/buy now/i.test(button.innerText||''));
+                  const stock=[...document.querySelectorAll('.vd-product-stock,[data-product-stock],.product-info__stock,.stock')].filter(visible).map(element=>(element.innerText||'').replace(/\s+/g,' ').trim()).join(' | ');
+                  return{title:document.querySelector('h1')?.innerText?.trim()||'',prices,scripts,stock,add_visible:!!add&&visible(add),add_disabled:!!add&&(add.disabled||add.getAttribute('aria-disabled')==='true'),buy_visible:!!buy&&visible(buy),buy_disabled:!!buy&&(buy.disabled||buy.getAttribute('aria-disabled')==='true')};
+                });
+                row.http_status=response?.status()||'';row.title=data.title;row.visible_candidates=data.prices.join(' | ');row.visible_price=closest(data.prices,row.api_price);row.visible_matches_api=row.api_price===null||row.visible_price===null?'':equalMoney(row.visible_price,row.api_price);
+                let node={};
+                for(const raw of data.scripts){try{const parsed=JSON.parse(raw);const found=[];walk(parsed,item=>{const type=item?.['@type'];const types=Array.isArray(type)?type:[type];if(types.includes('Product')||types.includes('ProductGroup'))found.push(item)});if(found.length){node=found[0];break}}catch{}}
+                const itemOffer=offer(node);const spec=itemOffer.priceSpecification||{};
+                row.jsonld_price=toNumber(itemOffer.price??spec.price??itemOffer.lowPrice);row.jsonld_currency=itemOffer.priceCurrency||spec.priceCurrency||'';row.jsonld_availability=itemOffer.availability||'';row.jsonld_available=availabilityBool(row.jsonld_availability);
+                row.jsonld_matches_visible=row.visible_price===null?'':equalMoney(row.jsonld_price,row.visible_price);row.jsonld_matches_api=row.api_price===null?'':equalMoney(row.jsonld_price,row.api_price);row.availability_matches_api=row.api_available===''||row.jsonld_available===null?'':row.api_available===row.jsonld_available;
+                row.stock_text=data.stock;row.add_visible=data.add_visible;row.add_disabled=data.add_disabled;row.buy_visible=data.buy_visible;row.buy_disabled=data.buy_disabled;
+                row.pass=row.http_status===200&&row.visible_matches_api!==false&&row.jsonld_matches_visible!==false&&row.jsonld_matches_api!==false&&row.availability_matches_api!==false&&row.add_visible&&row.buy_visible;
+              }catch(error){row.error=String(error.stack||error);row.pass=false}
+              browserRows.push(row);
+            }
+
+            // Variant-specific URL sample.
+            const variantRows=[];
+            for(const product of allProducts.filter(item=>Array.isArray(item.variants)&&item.variants.length>1).slice(0,10)){
+              for(const variant of [product.variants[0],product.variants[product.variants.length-1]].filter(Boolean)){
+                const variantId=variant.id||variant.variant_id;if(!variantId)continue;
+                const url=new URL(`/products/${product.handle}`,BASE);url.searchParams.set('variant',String(variantId));
+                const row={handle:product.handle,variant_id:variantId,api_variant_price:toNumber(variant.price),api_variant_available:variant.available===undefined?'':!!variant.available};
+                try{
+                  const response=await getWithRetry(context,url.href);row.http_status=response?.status()||'';const html=response?await response.text():'';const nodes=jsonProductNodes(html);const node=nodes[0]||{};const itemOffer=offer(node);const spec=itemOffer.priceSpecification||{};row.jsonld_price=toNumber(itemOffer.price??spec.price??itemOffer.lowPrice);row.jsonld_availability=itemOffer.availability||'';row.jsonld_available=availabilityBool(row.jsonld_availability);const candidates=htmlPriceCandidates(html);row.initial_html_price=closest(candidates,row.api_variant_price);row.jsonld_matches_variant=row.api_variant_price===null?'':equalMoney(row.jsonld_price,row.api_variant_price);row.initial_html_matches_variant=row.api_variant_price===null||row.initial_html_price===null?'':equalMoney(row.initial_html_price,row.api_variant_price);row.availability_matches_variant=row.api_variant_available===''||row.jsonld_available===null?'':row.api_variant_available===row.jsonld_available;row.pass=row.http_status===200&&row.jsonld_matches_variant!==false&&row.initial_html_matches_variant!==false&&row.availability_matches_variant!==false;
+                }catch(error){row.error=String(error.stack||error);row.pass=false}
+                variantRows.push(row);await sleep(150);
+              }
+            }
+
+            // One live cart price comparison, without ordering.
+            const cartRows=[];
+            const cartProduct=allProducts.find(item=>item.available!==false&&(!item.variants||item.variants.length<=1)&&toNumber(item.price)!==null);
+            if(cartProduct){
+              const row={handle:cartProduct.handle,api_price:toNumber(cartProduct.price)};
+              try{
+                await page.goto(new URL(`/products/${cartProduct.handle}`,BASE).href,{waitUntil:'domcontentloaded',timeout:90000});await page.waitForLoadState('networkidle',{timeout:18000}).catch(()=>{});await sleep(650);
+                const add=page.getByRole('button',{name:/add to cart/i}).first();if(!await add.count()||await add.isDisabled())throw new Error('Add to Cart unavailable');await add.click();await sleep(1000);await page.goto(new URL('/cart',BASE).href,{waitUntil:'domcontentloaded',timeout:90000});await sleep(650);
+                const prices=await page.evaluate(()=>[...new Set(((document.body.innerText||'').match(/\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?/g)||[]).map(value=>Number(value.replace(/[$,\s]/g,''))).filter(Number.isFinite))]);row.cart_candidates=prices.join(' | ');row.cart_price=closest(prices,row.api_price);row.cart_matches_api=row.cart_price===null||row.api_price===null?'':equalMoney(row.cart_price,row.api_price);row.pass=row.cart_matches_api===true;
+                const remove=page.locator('[data-cart-remove],button[aria-label*="remove" i],a[aria-label*="remove" i],button:has-text("Remove"),a:has-text("Remove")').first();if(await remove.count())await remove.click().catch(()=>{});
+              }catch(error){row.error=String(error.stack||error);row.pass=false}
+              cartRows.push(row);
+            }
+
+            await page.close();await context.close();await browser.close();
+
+            const statusCounts=productRows.reduce((acc,row)=>{const key=String(row.http_status||'error');acc[key]=(acc[key]||0)+1;return acc},{});
+            const jsonMismatches=productRows.filter(row=>row.http_status===200&&row.jsonld_matches_api===false);
+            const htmlMismatches=productRows.filter(row=>row.http_status===200&&row.initial_html_matches_api===false);
+            const currencyMismatches=productRows.filter(row=>row.http_status===200&&row.currency_matches_api===false);
+            const availabilityMismatches=productRows.filter(row=>row.http_status===200&&row.availability_matches_api===false);
+            const old100x=productRows.filter(row=>row.old_100x_pattern===true);
+            const missingJson=productRows.filter(row=>row.http_status===200&&!(row.product_jsonld_count>0));
+            const browserFailures=browserRows.filter(row=>row.pass!==true);const variantFailures=variantRows.filter(row=>row.pass!==true);const cartFailures=cartRows.filter(row=>row.pass!==true);
+            const summary={
+              audited_at:new Date().toISOString(),base_url:BASE.href,api_products_discovered:products.size,product_handles_audited:productRows.length,page_status_counts:statusCounts,page_http_200:productRows.filter(row=>row.http_status===200).length,
+              jsonld_price_mismatches:jsonMismatches.length,initial_html_price_mismatches:htmlMismatches.length,currency_mismatches:currencyMismatches.length,availability_mismatches:availabilityMismatches.length,old_100x_mismatches:old100x.length,missing_product_jsonld:missingJson.length,
+              browser_samples:browserRows.length,browser_failures:browserFailures.length,variant_urls_checked:variantRows.length,variant_failures:variantFailures.length,cart_checks:cartRows.length,cart_failures:cartFailures.length,
+              critical_samples:browserRows.filter(row=>criticalHandles.includes(row.handle)),
+              ready_for_gmc_price_submission:productRows.filter(row=>row.http_status===200).length>0&&jsonMismatches.length===0&&htmlMismatches.length===0&&currencyMismatches.length===0&&availabilityMismatches.length===0&&old100x.length===0&&missingJson.length===0&&browserFailures.length===0&&variantFailures.length===0&&cartFailures.length===0
+            };
+            writeCsv('audit/product-pages.csv',productRows);writeCsv('audit/browser-samples.csv',browserRows);writeCsv('audit/variant-pages.csv',variantRows);writeCsv('audit/cart-check.csv',cartRows);writeCsv('audit/mismatches.csv',productRows.filter(row=>row.http_status===200&&row.pass!==true));
+            fs.writeFileSync('audit/summary.json',JSON.stringify(summary,null,2));fs.writeFileSync('audit/api-responses.json',JSON.stringify(apiResponses,null,2));
+            const critical=summary.critical_samples.map(row=>`| ${row.handle} | ${row.api_price??''} | ${row.visible_price??''} | ${row.jsonld_price??''} | ${row.jsonld_currency||''} | ${row.jsonld_availability||''} | ${row.pass?'PASS':'FAIL'} |`).join('\n');
+            fs.writeFileSync('audit/REPORT.md',['# Vardentra live price and availability JSON audit','',`**Audited:** ${summary.audited_at}`,`**Result:** ${summary.ready_for_gmc_price_submission?'PASS — live price and availability signals are aligned':'FAIL — do not submit until mismatches are resolved'}`,'','## Coverage','',`- API products discovered: **${summary.api_products_discovered}**`,`- Product handles audited: **${summary.product_handles_audited}**`,`- Product pages returning HTTP 200: **${summary.page_http_200}**`,`- Browser samples: **${summary.browser_samples}**`,`- Variant URLs checked: **${summary.variant_urls_checked}**`,`- Cart price checks: **${summary.cart_checks}**`,'','## Mismatches','',`- JSON-LD/API price: **${summary.jsonld_price_mismatches}**`,`- Initial HTML/API price: **${summary.initial_html_price_mismatches}**`,`- Currency: **${summary.currency_mismatches}**`,`- Availability: **${summary.availability_mismatches}**`,`- Old 100× pattern: **${summary.old_100x_mismatches}**`,`- Missing Product JSON-LD: **${summary.missing_product_jsonld}**`,`- Browser failures: **${summary.browser_failures}**`,`- Variant failures: **${summary.variant_failures}**`,`- Cart failures: **${summary.cart_failures}**`,'','## Historically mismatched products','', '| Handle | API price | Visible price | JSON-LD price | Currency | Availability | Result |','|---|---:|---:|---:|---|---|---|',critical||'| None found | | | | | | |','','## Boundary','','This audit checked initial server HTML, JSON-LD, rendered prices, Shoplazza API data, selected variant URLs and one live cart line item. It did not inspect a private Merchant Center feed or place an order.'].join('\n')+'\n');
+          })().catch(error=>{fs.mkdirSync('audit',{recursive:true});fs.writeFileSync('audit/FATAL.txt',String(error.stack||error));process.exitCode=1});
+          JS
+          node audit.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vardentra-price-json-audit-v2-20260814
+          path: audit/
+          retention-days: 1
+          compression-level: 6
