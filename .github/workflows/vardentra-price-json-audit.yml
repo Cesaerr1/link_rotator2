@@ -1,0 +1,503 @@
+name: Vardentra live price JSON audit 2026-08-14
+
+on:
+  push:
+    branches:
+      - agent/vardentra-price-json-audit-20260814
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install audit dependencies
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install playwright@1.55.0 cheerio@1.0.0 >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null
+      - name: Run live structured-data audit
+        shell: bash
+        run: |
+          mkdir -p audit/screenshots
+          cat > audit.js <<'JS'
+          const { chromium } = require('playwright');
+          const cheerio = require('cheerio');
+          const fs = require('fs');
+
+          const BASE = new URL('https://www.vardentra.com/');
+          const ORIGIN = new URL('https://vardentra.myshoplaza.com/');
+          const EPSILON = 0.005;
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+          const safe = value => value.replace(/^\//, '').replace(/[?&#=/]+/g, '-').replace(/-+$/,'').slice(0,150) || 'page';
+          const number = value => {
+            if (value === null || value === undefined || value === '') return null;
+            const parsed = Number(String(value).replace(/[$,\s]/g, ''));
+            return Number.isFinite(parsed) ? parsed : null;
+          };
+          const moneyEqual = (a, b) => a !== null && b !== null && Math.abs(a - b) < EPSILON;
+          const availabilityBoolean = value => {
+            const text = String(value || '').toLowerCase();
+            if (/instock|limitedavailability|onlineonly/.test(text)) return true;
+            if (/outofstock|soldout|discontinued|instoreonly/.test(text)) return false;
+            return null;
+          };
+          const writeCsv = (file, rows) => {
+            if (!rows.length) { fs.writeFileSync(file, ''); return; }
+            const headers = [...new Set(rows.flatMap(row => Object.keys(row)))];
+            const escape = value => {
+              const text = typeof value === 'object' ? JSON.stringify(value) : String(value ?? '');
+              return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+            };
+            fs.writeFileSync(file, [headers.map(escape).join(','), ...rows.map(row => headers.map(header => escape(row[header])).join(','))].join('\n') + '\n');
+          };
+
+          function walkJson(node, callback) {
+            if (Array.isArray(node)) {
+              for (const item of node) walkJson(item, callback);
+              return;
+            }
+            if (!node || typeof node !== 'object') return;
+            callback(node);
+            for (const value of Object.values(node)) if (value && typeof value === 'object') walkJson(value, callback);
+          }
+
+          function productNodesFromHtml(html) {
+            const $ = cheerio.load(html);
+            const nodes = [];
+            $('script[type="application/ld+json"]').each((_, script) => {
+              const raw = $(script).text();
+              try {
+                const parsed = JSON.parse(raw);
+                walkJson(parsed, node => {
+                  const type = node['@type'];
+                  const types = Array.isArray(type) ? type : [type];
+                  if (types.includes('Product') || types.includes('ProductGroup')) nodes.push(node);
+                });
+              } catch {}
+            });
+            return nodes;
+          }
+
+          function offerFromNode(node) {
+            const offers = node?.offers;
+            if (Array.isArray(offers)) return offers[0] || {};
+            return offers || {};
+          }
+
+          function htmlPriceCandidates(html) {
+            const $ = cheerio.load(html);
+            const values = [];
+            const add = value => {
+              const parsed = number(value);
+              if (parsed !== null && parsed >= 0 && !values.includes(parsed)) values.push(parsed);
+            };
+            for (const selector of [
+              'meta[property="product:price:amount"]',
+              'meta[property="og:price:amount"]',
+              'meta[itemprop="price"]',
+              '[itemprop="price"]',
+              '[data-product-price]',
+              '.vd-product-price',
+              '.product-info__price',
+              '.product-price',
+              '.price'
+            ]) {
+              $(selector).each((_, element) => {
+                add($(element).attr('content'));
+                const text = clean($(element).text());
+                const matches = text.match(/[0-9][0-9,]*(?:\.[0-9]{1,4})?/g) || [];
+                for (const match of matches) add(match);
+              });
+            }
+            return values;
+          }
+
+          function chooseClosest(values, target) {
+            if (!values.length || target === null) return values[0] ?? null;
+            return [...values].sort((a,b) => Math.abs(a-target)-Math.abs(b-target))[0];
+          }
+
+          async function requestWithRetry(context, url, attempts = 5) {
+            let last = null;
+            for (let attempt = 1; attempt <= attempts; attempt++) {
+              try {
+                const response = await context.request.get(url, { failOnStatusCode: false, maxRedirects: 8, timeout: 60000 });
+                last = response;
+                if (response.status() !== 429 && response.status() < 500) return response;
+              } catch {}
+              await sleep(500 * attempt * attempt);
+            }
+            return last;
+          }
+
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext({
+              viewport: { width: 1440, height: 1050 },
+              ignoreHTTPSErrors: true,
+              locale: 'en-US',
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+            });
+
+            // Discover all products from the native Shoplazza search API.
+            const products = new Map();
+            const apiResponses = [];
+            const keywords = ['', 'mower', 'kayak', 'lift', 'bike', 'bicycle', 'generator', 'shed', 'swing', 'trampoline', 'gazebo', 'cardio', 'garden', 'home', 'portable', 'zero turn', 'pressure washer', 'fire pit'];
+            for (const keyword of keywords) {
+              for (let page = 0; page < 20; page++) {
+                try {
+                  const url = new URL('/api/search', ORIGIN);
+                  url.searchParams.set('keyword', keyword);
+                  url.searchParams.set('page', String(page));
+                  url.searchParams.set('limit', '100');
+                  const response = await context.request.get(url.href, { failOnStatusCode: false, timeout: 60000 });
+                  const body = await response.text();
+                  apiResponses.push({ keyword, page, status: response.status(), length: body.length });
+                  if (response.status() >= 400) break;
+                  const payload = JSON.parse(body);
+                  const list = payload?.data?.products || [];
+                  for (const product of list) if (product.handle) products.set(product.handle, product);
+                  if (!list.length || !payload?.data?.has_more) break;
+                } catch { break; }
+                await sleep(100);
+              }
+            }
+
+            // Add product handles from sitemap(s), when available.
+            const sitemapHandles = new Set();
+            async function parseSitemap(url, depth = 0) {
+              if (depth > 2) return;
+              try {
+                const response = await context.request.get(url, { failOnStatusCode: false, timeout: 60000 });
+                if (response.status() >= 400) return;
+                const xml = await response.text();
+                const locs = [...xml.matchAll(/<loc>(.*?)<\/loc>/g)].map(match => match[1].replace(/&amp;/g,'&'));
+                for (const loc of locs) {
+                  if (/\/products\//.test(loc)) {
+                    const match = new URL(loc).pathname.match(/^\/products\/([^/?#]+)/);
+                    if (match) sitemapHandles.add(decodeURIComponent(match[1]));
+                  } else if (/sitemap/i.test(loc)) {
+                    await parseSitemap(loc, depth + 1);
+                  }
+                }
+              } catch {}
+            }
+            await parseSitemap(new URL('/sitemap.xml', BASE).href);
+
+            const allHandles = new Set([...products.keys(), ...sitemapHandles]);
+            const allProducts = [...allHandles].map(handle => products.get(handle) || { handle, url: `/products/${handle}` }).sort((a,b) => String(a.handle).localeCompare(String(b.handle)));
+
+            // Ensure the historically mismatched products are explicitly tested.
+            const criticalHandles = [
+              'ryobi-48v-hp-brushless-54-inch-115-ah-battery-electric-riding-zero-turn-mower-2',
+              'stihl-rz-560-k-commercial-60-zero-turn-lawn-mower-2',
+              'hobie-mirage-itrek-angler-10-inflatable-fishing-kayak',
+              'global-industrial-electric-walk-behind-auto-floor-scrubber-18-cleaning-path-2',
+              'predator-4400-psi-4-2-gpm-13-hp-420cc-commercial-duty-pressure-washer-epa-2',
+              'the-outdoor-plus-84-del-mar-concrete-gas-fire-pit'
+            ];
+            for (const handle of criticalHandles) if (!allHandles.has(handle)) allProducts.push({ handle, url: `/products/${handle}`, critical: true });
+
+            const pageRows = [];
+            let cursor = 0;
+            async function pageWorker() {
+              while (cursor < allProducts.length) {
+                const product = allProducts[cursor++];
+                const handle = product.handle;
+                const url = new URL(`/products/${handle}`, BASE).href;
+                const row = {
+                  handle, url, critical: criticalHandles.includes(handle),
+                  api_id: product.id || '', api_title: product.title || '', api_sku: product.sku || '',
+                  api_price: number(product.price), api_currency: product.currency || product.price_currency || 'USD', api_available: product.available === undefined ? '' : !!product.available,
+                  api_variant_count: Array.isArray(product.variants) ? product.variants.length : 0
+                };
+                try {
+                  const response = await requestWithRetry(context, url);
+                  if (!response) throw new Error('No response after retries');
+                  row.http_status = response.status();
+                  row.final_url = response.url();
+                  const html = await response.text();
+                  row.html_length = html.length;
+                  const nodes = productNodesFromHtml(html);
+                  row.product_jsonld_count = nodes.length;
+                  const node = nodes.find(item => String(item.url || '').includes(handle)) || nodes[0] || {};
+                  const offer = offerFromNode(node);
+                  const priceSpec = offer.priceSpecification || {};
+                  row.jsonld_type = node['@type'] || '';
+                  row.offer_type = offer['@type'] || '';
+                  row.jsonld_price = number(offer.price ?? priceSpec.price ?? offer.lowPrice);
+                  row.jsonld_currency = offer.priceCurrency || priceSpec.priceCurrency || '';
+                  row.jsonld_availability = offer.availability || '';
+                  row.jsonld_available = availabilityBoolean(row.jsonld_availability);
+                  row.jsonld_sku = node.sku || '';
+                  const candidates = htmlPriceCandidates(html);
+                  row.initial_html_price_candidates = candidates.join(' | ');
+                  row.initial_html_price = chooseClosest(candidates, row.api_price);
+                  row.initial_html_has_price = row.initial_html_price !== null;
+                  row.jsonld_matches_api = row.api_price === null ? '' : moneyEqual(row.jsonld_price, row.api_price);
+                  row.initial_html_matches_api = row.api_price === null || row.initial_html_price === null ? '' : moneyEqual(row.initial_html_price, row.api_price);
+                  row.currency_matches_api = !row.api_currency || !row.jsonld_currency ? '' : String(row.jsonld_currency).toUpperCase() === String(row.api_currency).toUpperCase();
+                  row.availability_matches_api = row.api_available === '' || row.jsonld_available === null ? '' : row.jsonld_available === row.api_available;
+                  row.old_100x_pattern = row.api_price !== null && row.jsonld_price !== null && Math.abs((row.jsonld_price * 100) - row.api_price) < 0.02;
+                  row.pass = row.http_status === 200 && row.product_jsonld_count > 0 && (row.api_price === null || row.jsonld_matches_api === true) && (row.api_price === null || row.initial_html_matches_api !== false) && row.currency_matches_api !== false && row.availability_matches_api !== false && !row.old_100x_pattern;
+                } catch (error) {
+                  row.error = String(error.stack || error);
+                  row.pass = false;
+                }
+                pageRows.push(row);
+                await sleep(100);
+              }
+            }
+            await Promise.all(Array.from({ length: 6 }, () => pageWorker()));
+            pageRows.sort((a,b) => String(a.handle).localeCompare(String(b.handle)));
+
+            // Variant URL audit for up to 24 variants across variable products.
+            const variantRows = [];
+            const variableProducts = allProducts.filter(product => Array.isArray(product.variants) && product.variants.length > 1).slice(0, 12);
+            for (const product of variableProducts) {
+              const variants = [product.variants[0], product.variants[product.variants.length - 1]].filter(Boolean);
+              for (const variant of variants) {
+                const variantId = variant.id || variant.variant_id;
+                if (!variantId) continue;
+                const url = new URL(`/products/${product.handle}`, BASE);
+                url.searchParams.set('variant', String(variantId));
+                const row = {
+                  handle: product.handle, variant_id: variantId, url: url.href,
+                  api_variant_price: number(variant.price), api_variant_available: variant.available === undefined ? '' : !!variant.available,
+                  api_variant_sku: variant.sku || ''
+                };
+                try {
+                  const response = await requestWithRetry(context, url.href);
+                  row.http_status = response?.status() || '';
+                  const html = response ? await response.text() : '';
+                  const nodes = productNodesFromHtml(html);
+                  const node = nodes.find(item => String(item.url || '').includes(product.handle)) || nodes[0] || {};
+                  const offer = offerFromNode(node);
+                  const spec = offer.priceSpecification || {};
+                  row.jsonld_price = number(offer.price ?? spec.price ?? offer.lowPrice);
+                  row.jsonld_currency = offer.priceCurrency || spec.priceCurrency || '';
+                  row.jsonld_availability = offer.availability || '';
+                  row.jsonld_available = availabilityBoolean(row.jsonld_availability);
+                  const candidates = htmlPriceCandidates(html);
+                  row.initial_html_price = chooseClosest(candidates, row.api_variant_price);
+                  row.jsonld_matches_variant = row.api_variant_price === null ? '' : moneyEqual(row.jsonld_price, row.api_variant_price);
+                  row.initial_html_matches_variant = row.api_variant_price === null || row.initial_html_price === null ? '' : moneyEqual(row.initial_html_price, row.api_variant_price);
+                  row.availability_matches_variant = row.api_variant_available === '' || row.jsonld_available === null ? '' : row.jsonld_available === row.api_variant_available;
+                  row.pass = row.http_status === 200 && row.jsonld_matches_variant !== false && row.initial_html_matches_variant !== false && row.availability_matches_variant !== false;
+                } catch (error) { row.error = String(error.stack || error); row.pass = false; }
+                variantRows.push(row);
+                await sleep(200);
+              }
+            }
+
+            // Browser-rendered audit for 24 products, including the six historical samples.
+            const browser = await chromium.launch({ headless: true });
+            const page = await context.newPage();
+            const browserRows = [];
+            const browserProducts = [];
+            for (const handle of criticalHandles) {
+              const product = allProducts.find(item => item.handle === handle);
+              if (product) browserProducts.push(product);
+              else browserProducts.push({ handle, critical: true });
+            }
+            const remaining = allProducts.filter(item => !criticalHandles.includes(item.handle));
+            const extraCount = Math.min(18, remaining.length);
+            for (let index = 0; index < extraCount; index++) browserProducts.push(remaining[Math.floor(index * remaining.length / extraCount)]);
+
+            for (let index = 0; index < browserProducts.length; index++) {
+              const product = browserProducts[index];
+              const row = { handle: product.handle, api_price: number(product.price), api_available: product.available === undefined ? '' : !!product.available };
+              try {
+                const response = await page.goto(new URL(`/products/${product.handle}`, BASE).href, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+                await sleep(850);
+                if (index < 6) await page.screenshot({ path: `audit/screenshots/${index + 1}-${safe(product.handle)}.png`, fullPage: true }).catch(() => {});
+                const data = await page.evaluate(() => {
+                  const visible = element => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+                  const prices = [];
+                  const selectors = ['.vd-product-price','.product-info__price','[data-product-price]','.product-price','.price','.money'];
+                  for (const selector of selectors) {
+                    for (const element of document.querySelectorAll(selector)) {
+                      if (!visible(element)) continue;
+                      const text = (element.innerText || element.textContent || '').replace(/\s+/g,' ').trim();
+                      const matches = text.match(/[0-9][0-9,]*(?:\.[0-9]{1,4})?/g) || [];
+                      for (const match of matches) {
+                        const value = Number(match.replace(/,/g,''));
+                        if (Number.isFinite(value) && !prices.includes(value)) prices.push(value);
+                      }
+                    }
+                  }
+                  const scripts = [...document.querySelectorAll('script[type="application/ld+json"]')].map(script => script.textContent || '');
+                  const stockText = [...document.querySelectorAll('.vd-product-stock,[data-product-stock],.product-info__stock,.stock')].filter(visible).map(element => (element.innerText || '').replace(/\s+/g,' ').trim()).join(' | ');
+                  const add = [...document.querySelectorAll('button')].find(button => /add to cart/i.test(button.innerText || ''));
+                  const buy = [...document.querySelectorAll('button')].find(button => /buy now/i.test(button.innerText || ''));
+                  return {
+                    title: document.querySelector('h1')?.innerText?.trim() || '', prices, scripts, stockText,
+                    add_visible: !!add && visible(add), add_disabled: !!add && (add.disabled || add.getAttribute('aria-disabled') === 'true'),
+                    buy_visible: !!buy && visible(buy), buy_disabled: !!buy && (buy.disabled || buy.getAttribute('aria-disabled') === 'true')
+                  };
+                });
+                row.http_status = response?.status() || '';
+                row.title = data.title;
+                row.visible_price_candidates = data.prices.join(' | ');
+                row.visible_price = chooseClosest(data.prices, row.api_price);
+                row.visible_matches_api = row.api_price === null || row.visible_price === null ? '' : moneyEqual(row.visible_price, row.api_price);
+                let jsonNode = {};
+                for (const raw of data.scripts) {
+                  try {
+                    const parsed = JSON.parse(raw);
+                    const found = [];
+                    walkJson(parsed, node => {
+                      const type = node?.['@type'];
+                      const types = Array.isArray(type) ? type : [type];
+                      if (types.includes('Product') || types.includes('ProductGroup')) found.push(node);
+                    });
+                    if (found.length) { jsonNode = found[0]; break; }
+                  } catch {}
+                }
+                const offer = offerFromNode(jsonNode);
+                const spec = offer.priceSpecification || {};
+                row.jsonld_price = number(offer.price ?? spec.price ?? offer.lowPrice);
+                row.jsonld_currency = offer.priceCurrency || spec.priceCurrency || '';
+                row.jsonld_availability = offer.availability || '';
+                row.jsonld_available = availabilityBoolean(row.jsonld_availability);
+                row.jsonld_matches_visible = row.visible_price === null ? '' : moneyEqual(row.jsonld_price, row.visible_price);
+                row.jsonld_matches_api = row.api_price === null ? '' : moneyEqual(row.jsonld_price, row.api_price);
+                row.availability_matches_api = row.api_available === '' || row.jsonld_available === null ? '' : row.jsonld_available === row.api_available;
+                row.stock_text = data.stockText;
+                row.add_visible = data.add_visible;
+                row.add_disabled = data.add_disabled;
+                row.buy_visible = data.buy_visible;
+                row.buy_disabled = data.buy_disabled;
+                row.pass = row.http_status === 200 && row.visible_matches_api !== false && row.jsonld_matches_visible !== false && row.jsonld_matches_api !== false && row.availability_matches_api !== false && row.add_visible && row.buy_visible;
+              } catch (error) { row.error = String(error.stack || error); row.pass = false; }
+              browserRows.push(row);
+            }
+
+            // Cart price check using an in-stock simple product; no order is placed.
+            const cartChecks = [];
+            const cartProduct = allProducts.find(product => product.available !== false && (!product.variants || product.variants.length <= 1) && number(product.price) !== null) || allProducts[0];
+            if (cartProduct) {
+              const row = { handle: cartProduct.handle, api_price: number(cartProduct.price) };
+              try {
+                await page.goto(new URL(`/products/${cartProduct.handle}`, BASE).href, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+                await sleep(700);
+                const add = page.getByRole('button', { name: /add to cart/i }).first();
+                if (!await add.count() || await add.isDisabled()) throw new Error('Add to Cart unavailable');
+                await add.click();
+                await sleep(1200);
+                await page.goto(new URL('/cart', BASE).href, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                await sleep(700);
+                const data = await page.evaluate(() => {
+                  const text = document.body.innerText || '';
+                  const matches = text.match(/\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?/g) || [];
+                  return { prices: [...new Set(matches.map(value => Number(value.replace(/[$,\s]/g,''))).filter(Number.isFinite))], text: text.replace(/\s+/g,' ').trim().slice(0,2000) };
+                });
+                row.cart_price_candidates = data.prices.join(' | ');
+                row.cart_price = chooseClosest(data.prices, row.api_price);
+                row.cart_matches_api = row.cart_price === null || row.api_price === null ? '' : moneyEqual(row.cart_price, row.api_price);
+                row.pass = row.cart_matches_api === true;
+                const remove = page.locator('[data-cart-remove],button[aria-label*="remove" i],a[aria-label*="remove" i],button:has-text("Remove"),a:has-text("Remove")').first();
+                if (await remove.count()) await remove.click().catch(() => {});
+              } catch (error) { row.error = String(error.stack || error); row.pass = false; }
+              cartChecks.push(row);
+            }
+
+            await page.close();
+            await browser.close();
+            await context.close();
+
+            const statusCounts = pageRows.reduce((acc,row) => { const key = String(row.http_status || 'error'); acc[key] = (acc[key] || 0) + 1; return acc; }, {});
+            const mismatchedPages = pageRows.filter(row => row.http_status === 200 && row.pass !== true);
+            const jsonPriceMismatches = pageRows.filter(row => row.http_status === 200 && row.jsonld_matches_api === false);
+            const htmlPriceMismatches = pageRows.filter(row => row.http_status === 200 && row.initial_html_matches_api === false);
+            const currencyMismatches = pageRows.filter(row => row.http_status === 200 && row.currency_matches_api === false);
+            const availabilityMismatches = pageRows.filter(row => row.http_status === 200 && row.availability_matches_api === false);
+            const old100x = pageRows.filter(row => row.old_100x_pattern === true);
+            const missingJsonLd = pageRows.filter(row => row.http_status === 200 && !(row.product_jsonld_count > 0));
+            const browserFailures = browserRows.filter(row => row.pass !== true);
+            const variantFailures = variantRows.filter(row => row.pass !== true);
+            const cartFailures = cartChecks.filter(row => row.pass !== true);
+
+            const summary = {
+              audited_at: new Date().toISOString(), base_url: BASE.href,
+              api_products_discovered: products.size, sitemap_product_handles: sitemapHandles.size, total_handles_audited: pageRows.length,
+              page_status_counts: statusCounts, page_http_200: pageRows.filter(row => row.http_status === 200).length,
+              jsonld_price_mismatches: jsonPriceMismatches.length,
+              initial_html_price_mismatches: htmlPriceMismatches.length,
+              currency_mismatches: currencyMismatches.length,
+              availability_mismatches: availabilityMismatches.length,
+              old_100x_mismatches: old100x.length,
+              missing_product_jsonld: missingJsonLd.length,
+              full_page_failures: mismatchedPages.length,
+              browser_samples: browserRows.length,
+              browser_sample_failures: browserFailures.length,
+              variant_urls_checked: variantRows.length,
+              variant_failures: variantFailures.length,
+              cart_checks: cartChecks.length,
+              cart_failures: cartFailures.length,
+              critical_samples: browserRows.filter(row => criticalHandles.includes(row.handle)),
+              ready_for_gmc_price_submission: pageRows.filter(row => row.http_status === 200).length > 0 && jsonPriceMismatches.length === 0 && htmlPriceMismatches.length === 0 && currencyMismatches.length === 0 && availabilityMismatches.length === 0 && old100x.length === 0 && missingJsonLd.length === 0 && browserFailures.length === 0 && variantFailures.length === 0 && cartFailures.length === 0
+            };
+
+            writeCsv('audit/product-pages.csv', pageRows);
+            writeCsv('audit/browser-samples.csv', browserRows);
+            writeCsv('audit/variant-pages.csv', variantRows);
+            writeCsv('audit/cart-check.csv', cartChecks);
+            writeCsv('audit/mismatches.csv', mismatchedPages);
+            fs.writeFileSync('audit/summary.json', JSON.stringify(summary, null, 2));
+            fs.writeFileSync('audit/api-responses.json', JSON.stringify(apiResponses, null, 2));
+
+            const criticalLines = summary.critical_samples.map(row => `| ${row.handle} | ${row.api_price ?? ''} | ${row.visible_price ?? ''} | ${row.jsonld_price ?? ''} | ${row.jsonld_currency || ''} | ${row.jsonld_availability || ''} | ${row.pass ? 'PASS' : 'FAIL'} |`).join('\n');
+            const report = [
+              '# Vardentra live structured-price audit', '',
+              `**Audited:** ${summary.audited_at}`,
+              `**Store:** ${BASE.href}`, '',
+              '## Result', '',
+              `**${summary.ready_for_gmc_price_submission ? 'PASS — live price/availability signals are aligned' : 'FAIL — do not submit until listed mismatches are resolved'}**`, '',
+              '## Coverage', '',
+              `- API products discovered: **${summary.api_products_discovered}**`,
+              `- Sitemap product handles: **${summary.sitemap_product_handles}**`,
+              `- Product handles audited: **${summary.total_handles_audited}**`,
+              `- Product pages returning HTTP 200: **${summary.page_http_200}**`,
+              `- Browser-rendered samples: **${summary.browser_samples}**`,
+              `- Variant-specific URLs checked: **${summary.variant_urls_checked}**`,
+              `- Cart price checks: **${summary.cart_checks}**`, '',
+              '## Mismatch counts', '',
+              `- JSON-LD versus Shoplazza API price: **${summary.jsonld_price_mismatches}**`,
+              `- Initial HTML versus Shoplazza API price: **${summary.initial_html_price_mismatches}**`,
+              `- Currency mismatches: **${summary.currency_mismatches}**`,
+              `- Availability mismatches: **${summary.availability_mismatches}**`,
+              `- Old 100× price pattern: **${summary.old_100x_mismatches}**`,
+              `- Missing Product JSON-LD: **${summary.missing_product_jsonld}**`,
+              `- Browser-sample failures: **${summary.browser_sample_failures}**`,
+              `- Variant failures: **${summary.variant_failures}**`,
+              `- Cart failures: **${summary.cart_failures}**`, '',
+              '## Historically mismatched samples', '',
+              '| Handle | Shoplazza/API price | Visible price | JSON-LD price | Currency | Availability | Result |',
+              '|---|---:|---:|---:|---|---|---|',
+              criticalLines || '| No critical samples found | | | | | | |', '',
+              '## Boundary', '',
+              'The audit checked the live initial HTML, live JSON-LD, rendered visible prices, Shoplazza native product API values, selected-variant URLs, button availability, and one cart line-item price. It did not place an order or inspect a private Merchant Center feed. Refresh or regenerate the Merchant Center data source after publishing the corrected theme.'
+            ].join('\n');
+            fs.writeFileSync('audit/REPORT.md', report + '\n');
+          })().catch(error => {
+            fs.mkdirSync('audit', { recursive: true });
+            fs.writeFileSync('audit/FATAL.txt', String(error.stack || error));
+            process.exitCode = 1;
+          });
+          JS
+          node audit.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vardentra-price-json-audit-20260814
+          path: audit/
+          retention-days: 1
+          compression-level: 6
